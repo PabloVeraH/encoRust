@@ -1,0 +1,14 @@
+[package]
+name = "mp3-wasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "wasm-bindgen bridge exposing mp3-core's streaming encode API to JS."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+mp3-core = { path = "../mp3-core", default-features = false }
+wasm-bindgen.workspace = true
