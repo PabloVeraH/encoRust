@@ -1,0 +1,24 @@
+# --- Build artifacts ---
+/target/
+**/*.rs.bk
+*.pdb
+
+# --- Development plan (kept local, not published) ---
+/docs/
+
+# --- AI agent/tool local config/state (not project code) ---
+.claude/
+.agent/
+.opencode/
+
+# --- Local test fixtures (large or licensing-encumbered audio) ---
+/tests/fixtures/large/
+*.wav.local
+*.wav
+*.mp3
+
+# --- Editor / OS cruft ---
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json

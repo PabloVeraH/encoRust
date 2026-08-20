@@ -1,0 +1,16 @@
+[package]
+name = "mp3-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "encorust: WAV -> MP3 command-line encoder built on mp3-core."
+
+[[bin]]
+name = "encorust"
+path = "src/main.rs"
+
+[dependencies]
+mp3-core = { path = "../mp3-core" }
+hound.workspace = true
+clap.workspace = true

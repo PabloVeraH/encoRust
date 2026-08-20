@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mp3-core",
+    "crates/mp3-cli",
+    "crates/mp3-wasm",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT OR Apache-2.0"
+authors = ["encoRust contributors"]
+repository = "https://github.com/REPLACE_ME/encoRust"
+
+# Shared dependency versions across the workspace. Individual crates opt in
+# with `dep_name.workspace = true`. Keep this list small — mp3-core in
+# particular should stay close to dependency-free (see
+# docs/mp3-encoder/03-project-setup.md for the rationale).
+[workspace.dependencies]
+thiserror = { version = "2", default-features = false }
+hound = "3"          # WAV reading, mp3-cli only
+clap = { version = "4", features = ["derive"] }
+wasm-bindgen = "0.2"
+proptest = "1"
+criterion = "0.5"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+[profile.bench]
+inherits = "release"
+
+# wasm binaries care about code size as much as speed; mp3-wasm overrides
+# this further with a dedicated profile once M9 lands (see chapter 12).
+[profile.release.package.mp3-wasm]
+opt-level = "s"
