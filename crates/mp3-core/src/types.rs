@@ -72,6 +72,15 @@ impl MpegVersion {
     pub const fn samples_per_frame(self) -> usize {
         self.granules_per_frame() * SAMPLES_PER_GRANULE
     }
+
+    /// 2-bit frame header `version` field: `11` = MPEG-1, `10` = MPEG-2 LSF.
+    #[must_use]
+    pub const fn header_bits(self) -> u8 {
+        match self {
+            Self::Mpeg1 => 0b11,
+            Self::Mpeg2Lsf => 0b10,
+        }
+    }
 }
 
 /// Supported sample rates across both MPEG-1 and MPEG-2 LSF. MPEG-2.5
@@ -117,37 +126,165 @@ impl SampleRate {
         }
     }
 
-    /// The 2-bit `sampling_frequency` frame header field value (shared
-    /// between MPEG-1 and MPEG-2 LSF; the header's 2-bit version field
-    /// disambiguates which table applies on decode).
+    /// The 2-bit `sampling_frequency` frame header field value.
     ///
-    /// Expected mapping per the guide (`docs/mp3-encoder/04-phase1` §2 —
-    /// a secondary source; the pinning test must cite Annex B or two
-    /// cross-checked decoders): `00` = 44100/22050, `01` = 48000/24000,
-    /// `10` = 32000/16000, `11` = reserved.
+    /// The same 2-bit codes are reused between MPEG-1 and MPEG-2 LSF;
+    /// the header's 2-bit version field disambiguates which sample-rate
+    /// row applies on decode.
     ///
-    /// # Panics
-    ///
-    /// Always, in this scaffold — implement in M1 alongside its
-    /// provenance test. See `docs/mp3-encoder/00-overview.md` §4.1.
+    /// ISO/IEC 11172-3 Annex B, Table B.1 / ISO/IEC 13818-3 §2.4.2.3:
+    /// `00` = 44100/22050, `01` = 48000/24000, `10` = 32000/16000.
     #[must_use]
     pub fn header_bits(self) -> u8 {
-        todo!("M1: implement per 04-phase1 §2 + provenance test vs. Annex B Table B.1")
+        match self {
+            Self::Hz44100 | Self::Hz22050 => 0b00,
+            Self::Hz48000 | Self::Hz24000 => 0b01,
+            Self::Hz32000 | Self::Hz16000 => 0b10,
+        }
     }
 }
 
-/// Encoder-facing bitrate selection for CBR/ABR, in kbps. Validity
-/// against the version-specific bitrate table (14 legal values per
-/// ISO/IEC 11172-3 Annex B, Table B.1 for MPEG-1; a different, lower
-/// table for MPEG-2 LSF) is enforced at `Encoder::new` — see
-/// `docs/mp3-encoder/04-phase1-pcm-io-and-framing.md` §2.
-///
-/// TODO(M1): replace this newtype with a closed enum over the exact
-/// legal values once the bitrate table has been transcribed and
-/// cross-checked, so invalid bitrates are unrepresentable rather than
-/// merely rejected at runtime.
+/// Legal MPEG Layer III bitrates, per ISO/IEC 11172-3 Annex B Table B.1
+/// (MPEG-1) and ISO/IEC 13818-3 (MPEG-2 LSF). "Parse, don't validate" —
+/// an invalid bitrate is unrepresentable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Bitrate(pub u32);
+#[non_exhaustive]
+pub enum Bitrate {
+    /// 8 kbps — MPEG-2 LSF only.
+    Kbps8,
+    /// 16 kbps — MPEG-2 LSF only.
+    Kbps16,
+    /// 24 kbps — MPEG-2 LSF only.
+    Kbps24,
+    /// 32 kbps — both MPEG-1 (index 1) and MPEG-2 LSF (index 4).
+    Kbps32,
+    /// 40 kbps — both MPEG-1 (index 2) and MPEG-2 LSF (index 5).
+    Kbps40,
+    /// 48 kbps — both MPEG-1 (index 3) and MPEG-2 LSF (index 6).
+    Kbps48,
+    /// 56 kbps — both MPEG-1 (index 4) and MPEG-2 LSF (index 7).
+    Kbps56,
+    /// 64 kbps — both MPEG-1 (index 5) and MPEG-2 LSF (index 8).
+    Kbps64,
+    /// 80 kbps — both MPEG-1 (index 6) and MPEG-2 LSF (index 9).
+    Kbps80,
+    /// 96 kbps — both MPEG-1 (index 7) and MPEG-2 LSF (index 10).
+    Kbps96,
+    /// 112 kbps — both MPEG-1 (index 8) and MPEG-2 LSF (index 11).
+    Kbps112,
+    /// 128 kbps — both MPEG-1 (index 9) and MPEG-2 LSF (index 12).
+    Kbps128,
+    /// 144 kbps — MPEG-2 LSF only (index 13).
+    Kbps144,
+    /// 160 kbps — both MPEG-1 (index 10) and MPEG-2 LSF (index 14).
+    Kbps160,
+    /// 192 kbps — MPEG-1 only (index 11).
+    Kbps192,
+    /// 224 kbps — MPEG-1 only (index 12).
+    Kbps224,
+    /// 256 kbps — MPEG-1 only (index 13).
+    Kbps256,
+    /// 320 kbps — MPEG-1 only (index 14).
+    Kbps320,
+}
+
+impl Bitrate {
+    /// The bitrate value in kbps.
+    #[must_use]
+    pub const fn as_kbps(self) -> u32 {
+        match self {
+            Self::Kbps8 => 8,
+            Self::Kbps16 => 16,
+            Self::Kbps24 => 24,
+            Self::Kbps32 => 32,
+            Self::Kbps40 => 40,
+            Self::Kbps48 => 48,
+            Self::Kbps56 => 56,
+            Self::Kbps64 => 64,
+            Self::Kbps80 => 80,
+            Self::Kbps96 => 96,
+            Self::Kbps112 => 112,
+            Self::Kbps128 => 128,
+            Self::Kbps144 => 144,
+            Self::Kbps160 => 160,
+            Self::Kbps192 => 192,
+            Self::Kbps224 => 224,
+            Self::Kbps256 => 256,
+            Self::Kbps320 => 320,
+        }
+    }
+
+    /// Returns the 4-bit `bitrate_index` for this bitrate given a version,
+    /// or `None` if this bitrate is not legal for that version.
+    ///
+    /// Index values 1–14 per the standard tables; index 0 (`free format`)
+    /// is never returned by this encoder.
+    #[must_use]
+    pub fn header_index(self, version: MpegVersion) -> Option<u8> {
+        match version {
+            MpegVersion::Mpeg1 => match self {
+                Self::Kbps32 => Some(1),
+                Self::Kbps40 => Some(2),
+                Self::Kbps48 => Some(3),
+                Self::Kbps56 => Some(4),
+                Self::Kbps64 => Some(5),
+                Self::Kbps80 => Some(6),
+                Self::Kbps96 => Some(7),
+                Self::Kbps112 => Some(8),
+                Self::Kbps128 => Some(9),
+                Self::Kbps160 => Some(10),
+                Self::Kbps192 => Some(11),
+                Self::Kbps224 => Some(12),
+                Self::Kbps256 => Some(13),
+                Self::Kbps320 => Some(14),
+                _ => None,
+            },
+            MpegVersion::Mpeg2Lsf => match self {
+                Self::Kbps8 => Some(1),
+                Self::Kbps16 => Some(2),
+                Self::Kbps24 => Some(3),
+                Self::Kbps32 => Some(4),
+                Self::Kbps40 => Some(5),
+                Self::Kbps48 => Some(6),
+                Self::Kbps56 => Some(7),
+                Self::Kbps64 => Some(8),
+                Self::Kbps80 => Some(9),
+                Self::Kbps96 => Some(10),
+                Self::Kbps112 => Some(11),
+                Self::Kbps128 => Some(12),
+                Self::Kbps144 => Some(13),
+                Self::Kbps160 => Some(14),
+                _ => None,
+            },
+        }
+    }
+
+    /// Looks up a [`Bitrate`] by its kbps value.
+    #[must_use]
+    pub fn from_kbps(kbps: u32) -> Option<Self> {
+        Some(match kbps {
+            8 => Self::Kbps8,
+            16 => Self::Kbps16,
+            24 => Self::Kbps24,
+            32 => Self::Kbps32,
+            40 => Self::Kbps40,
+            48 => Self::Kbps48,
+            56 => Self::Kbps56,
+            64 => Self::Kbps64,
+            80 => Self::Kbps80,
+            96 => Self::Kbps96,
+            112 => Self::Kbps112,
+            128 => Self::Kbps128,
+            144 => Self::Kbps144,
+            160 => Self::Kbps160,
+            192 => Self::Kbps192,
+            224 => Self::Kbps224,
+            256 => Self::Kbps256,
+            320 => Self::Kbps320,
+            _ => return None,
+        })
+    }
+}
 
 /// How channel data is coded. `JointStereoMs`/`JointStereoIntensity` are
 /// **encoder-side strategy choices**, not raw bitstream fields — the
@@ -176,6 +313,30 @@ impl ChannelMode {
         match self {
             Self::Mono => 1,
             Self::Stereo | Self::JointStereoMs | Self::JointStereoIntensity | Self::DualMono => 2,
+        }
+    }
+
+    /// 2-bit frame header `mode` field:
+    /// `00` = stereo, `01` = joint stereo, `10` = dual channel, `11` = mono.
+    #[must_use]
+    pub const fn header_mode_bits(self) -> u8 {
+        match self {
+            Self::Stereo => 0b00,
+            Self::JointStereoMs | Self::JointStereoIntensity => 0b01,
+            Self::DualMono => 0b10,
+            Self::Mono => 0b11,
+        }
+    }
+
+    /// 2-bit `mode_extension` field — meaningful only when
+    /// `mode == joint stereo` (`01`). Bit 1 = MS stereo on,
+    /// bit 0 = intensity stereo on. Returns `00` for non-joint modes.
+    #[must_use]
+    pub const fn header_mode_extension_bits(self) -> u8 {
+        match self {
+            Self::JointStereoMs => 0b10,
+            Self::JointStereoIntensity => 0b01,
+            _ => 0b00,
         }
     }
 }

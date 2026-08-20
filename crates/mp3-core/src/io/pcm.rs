@@ -3,7 +3,7 @@
 //! See `docs/mp3-encoder/04-phase1-pcm-io-and-framing.md` §4-5.
 
 use crate::error::EncodeError;
-use crate::types::{ChannelMode, MpegVersion, MAX_SAMPLES_PER_FRAME};
+use crate::types::{ChannelMode, MpegVersion, MAX_CHANNELS, MAX_SAMPLES_PER_FRAME};
 
 /// One frame's worth of PCM, deinterleaved and normalized to `f32` in
 /// `[-1.0, 1.0]` — `version.samples_per_frame()` samples per channel
@@ -17,6 +17,7 @@ use crate::types::{ChannelMode, MpegVersion, MAX_SAMPLES_PER_FRAME};
 /// choice consistent with how the psychoacoustic model's absolute
 /// threshold of hearing is calibrated (chapter 07) — see
 /// `docs/mp3-encoder/04-phase1-pcm-io-and-framing.md` §4.
+#[derive(Debug)]
 pub struct PcmBuffer {
     channels: [[f32; MAX_SAMPLES_PER_FRAME]; 2], // index 1 unused when mono
     channel_count: usize,
@@ -43,8 +44,29 @@ impl PcmBuffer {
         mode: ChannelMode,
         version: MpegVersion,
     ) -> Result<Self, EncodeError> {
-        let _ = (samples, mode, version);
-        todo!("M1: deinterleave, divide by 32768.0 — see 04-phase1 §4")
+        let n_channels = mode.channel_count();
+        let expected = n_channels * version.samples_per_frame();
+        if samples.len() != expected {
+            return Err(EncodeError::BufferLengthMismatch {
+                expected,
+                got: samples.len(),
+            });
+        }
+
+        let mut channels = [[0.0f32; MAX_SAMPLES_PER_FRAME]; MAX_CHANNELS];
+        let spc = version.samples_per_frame();
+
+        for ch in 0..n_channels {
+            for i in 0..spc {
+                channels[ch][i] = f32::from(samples[i * n_channels + ch]) / 32768.0;
+            }
+        }
+
+        Ok(Self {
+            channels,
+            channel_count: n_channels,
+            samples_per_channel: spc,
+        })
     }
 
     /// Builds a `PcmBuffer` from interleaved `f32` PCM already normalized
@@ -60,8 +82,29 @@ impl PcmBuffer {
         mode: ChannelMode,
         version: MpegVersion,
     ) -> Result<Self, EncodeError> {
-        let _ = (samples, mode, version);
-        todo!("M1: deinterleave — see 04-phase1 §4")
+        let n_channels = mode.channel_count();
+        let expected = n_channels * version.samples_per_frame();
+        if samples.len() != expected {
+            return Err(EncodeError::BufferLengthMismatch {
+                expected,
+                got: samples.len(),
+            });
+        }
+
+        let mut channels = [[0.0f32; MAX_SAMPLES_PER_FRAME]; MAX_CHANNELS];
+        let spc = version.samples_per_frame();
+
+        for ch in 0..n_channels {
+            for i in 0..spc {
+                channels[ch][i] = samples[i * n_channels + ch];
+            }
+        }
+
+        Ok(Self {
+            channels,
+            channel_count: n_channels,
+            samples_per_channel: spc,
+        })
     }
 
     /// The valid samples for one channel (`0` = left/mono, `1` = right):
@@ -95,9 +138,112 @@ impl PcmBuffer {
 
 #[cfg(test)]
 mod tests {
-    // TODO(M1): round-trip a synthetic [L0,R0,L1,R1,...] fixture through
-    // both from_i16_interleaved and from_f32_interleaved and assert the
-    // deinterleaved channel data matches — for BOTH an MPEG-1 (1152) and
-    // an LSF (576) case. See
-    // docs/mp3-encoder/04-phase1-pcm-io-and-framing.md §6.
+    use super::*;
+    use crate::types::{ChannelMode, MpegVersion};
+
+    #[test]
+    fn i16_deinterleave_stereo_mpeg1() {
+        let spf = MpegVersion::Mpeg1.samples_per_frame(); // 1152
+        let total = 2 * spf;
+        let mut interleaved = Vec::with_capacity(total);
+        for i in 0..spf {
+            interleaved.push(i as i16); // left
+            interleaved.push((i + 1000) as i16); // right
+        }
+        let buf =
+            PcmBuffer::from_i16_interleaved(&interleaved, ChannelMode::Stereo, MpegVersion::Mpeg1)
+                .expect("valid MPEG-1 stereo buffer");
+        assert_eq!(buf.samples_per_channel(), spf);
+        assert_eq!(buf.channel_count(), 2);
+        let left = buf.channel(0);
+        let right = buf.channel(1);
+        assert_eq!(left.len(), spf);
+        assert_eq!(right.len(), spf);
+        // Check deinterleaving correctness
+        assert!((left[0] - 0.0).abs() < 1e-6);
+        assert!((left[1] - (1.0 / 32768.0)).abs() < 1e-6);
+        assert!((right[0] - (1000.0 / 32768.0)).abs() < 1e-6);
+        assert!((right[1] - (1001.0 / 32768.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn i16_deinterleave_mono_lsf() {
+        let spf = MpegVersion::Mpeg2Lsf.samples_per_frame(); // 576
+        let mut interleaved = Vec::with_capacity(spf);
+        for i in 0..spf {
+            interleaved.push(i as i16);
+        }
+        let buf =
+            PcmBuffer::from_i16_interleaved(&interleaved, ChannelMode::Mono, MpegVersion::Mpeg2Lsf)
+                .expect("valid LSF mono buffer");
+        assert_eq!(buf.samples_per_channel(), spf);
+        assert_eq!(buf.channel_count(), 1);
+        let mono = buf.channel(0);
+        assert_eq!(mono.len(), spf);
+        assert!((mono[0] - 0.0).abs() < 1e-6);
+        assert!((mono[spf - 1] - ((spf - 1) as f32 / 32768.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn f32_deinterleave_stereo_mpeg1() {
+        let spf = MpegVersion::Mpeg1.samples_per_frame(); // 1152
+        let total = 2 * spf;
+        let mut interleaved = Vec::with_capacity(total);
+        for i in 0..spf {
+            interleaved.push(i as f32 / 100.0);
+            interleaved.push((i as f32 + 0.5) / 100.0);
+        }
+        let buf =
+            PcmBuffer::from_f32_interleaved(&interleaved, ChannelMode::Stereo, MpegVersion::Mpeg1)
+                .expect("valid f32 stereo buffer");
+        assert_eq!(buf.samples_per_channel(), spf);
+        let left = buf.channel(0);
+        let right = buf.channel(1);
+        assert!((left[0] - 0.0).abs() < 1e-6);
+        assert!((left[1] - 0.01).abs() < 1e-6);
+        assert!((right[0] - 0.005).abs() < 1e-6);
+    }
+
+    #[test]
+    fn f32_deinterleave_mono_lsf() {
+        let spf = MpegVersion::Mpeg2Lsf.samples_per_frame(); // 576
+        let mut interleaved = Vec::with_capacity(spf);
+        for i in 0..spf {
+            interleaved.push(i as f32 / 100.0);
+        }
+        let buf =
+            PcmBuffer::from_f32_interleaved(&interleaved, ChannelMode::Mono, MpegVersion::Mpeg2Lsf)
+                .expect("valid f32 LSF mono buffer");
+        assert_eq!(buf.samples_per_channel(), spf);
+        assert_eq!(buf.channel_count(), 1);
+    }
+
+    #[test]
+    fn rejects_wrong_length_i16() {
+        let samples = [0i16; 10]; // too short for any frame size
+        let err = PcmBuffer::from_i16_interleaved(&samples, ChannelMode::Mono, MpegVersion::Mpeg1)
+            .unwrap_err();
+        assert!(matches!(err, EncodeError::BufferLengthMismatch { .. }));
+    }
+
+    #[test]
+    fn rejects_wrong_length_f32() {
+        let samples = [0.0f32; 10];
+        let err =
+            PcmBuffer::from_f32_interleaved(&samples, ChannelMode::Stereo, MpegVersion::Mpeg1)
+                .unwrap_err();
+        assert!(matches!(err, EncodeError::BufferLengthMismatch { .. }));
+    }
+
+    #[test]
+    fn channel_0_is_used_for_mono() {
+        let spf = MpegVersion::Mpeg2Lsf.samples_per_frame();
+        let samples: Vec<i16> = (0..spf as i16).collect();
+        let buf =
+            PcmBuffer::from_i16_interleaved(&samples, ChannelMode::Mono, MpegVersion::Mpeg2Lsf)
+                .expect("valid mono buffer");
+        let chan = buf.channel(0);
+        assert_eq!(chan.len(), spf);
+        assert!((chan[5] - (5.0 / 32768.0)).abs() < 1e-6);
+    }
 }

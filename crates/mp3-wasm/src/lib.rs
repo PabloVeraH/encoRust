@@ -73,7 +73,9 @@ impl WasmEncoder {
         let config = EncoderConfig {
             sample_rate,
             channel_mode,
-            rate_control: RateControl::Cbr(Bitrate(bitrate_kbps)),
+            rate_control: RateControl::Cbr(
+                Bitrate::from_kbps(bitrate_kbps).expect("invalid bitrate"),
+            ),
         };
         let inner =
             mp3_core::Encoder::new(config).map_err(|e| JsValue::from_str(&format!("{e}")))?;

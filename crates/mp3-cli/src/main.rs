@@ -76,7 +76,7 @@ fn main() {
     };
 
     let rate_control = if let Some(kbps) = args.bitrate {
-        mp3_core::bitstream::RateControl::Cbr(Bitrate(kbps))
+        mp3_core::bitstream::RateControl::Cbr(Bitrate::from_kbps(kbps).expect("invalid bitrate"))
     } else if let Some(q) = args.vbr_quality {
         mp3_core::bitstream::RateControl::Vbr(mp3_core::bitstream::reservoir::VbrQuality(q))
     } else {
