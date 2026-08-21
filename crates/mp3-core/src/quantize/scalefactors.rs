@@ -2,35 +2,31 @@
 //! `docs/mp3-encoder/08-phase5-quantization-loop.md` §1.
 //!
 //! These boundaries are distinct from the psychoacoustic model's
-//! partition table ([`crate::psychoacoustic`]) even though both
-//! approximate critical bands — do not conflate the two; one groups FFT
-//! bins for masking estimation, this one groups MDCT lines for
-//! quantization/coding. See
+//! *partition* table ([`crate::psychoacoustic::compute_partition_map`])
+//! even though both approximate critical bands — do not conflate the
+//! two; the partition table groups FFT bins for masking estimation (~48
+//! partitions), while this one groups MDCT lines for quantization/coding
+//! (22 long-block / 13 short-block bands). See
 //! `docs/mp3-encoder/08-phase5-quantization-loop.md` §1 for the explicit
 //! warning.
+//!
+//! Unlike the partition table, the scalefactor-band grid itself is
+//! **shared** between this module and the psychoacoustic model: chapter
+//! 07 §4.5 maps partition thresholds onto "the 32-subband/scalefactor-band
+//! grid used by chapters 06/08" to compute per-band SMR, i.e. M4's SMR
+//! output and M5's quantization both need the exact same Annex B table.
+//! It is defined once, in [`crate::psychoacoustic::tables`] (where it was
+//! sourced and table-provenance-tested for M4), and re-exported here
+//! rather than duplicated — an earlier version of this file kept an
+//! independent, differently-shaped placeholder (`[[usize; 22]; 6]` for
+//! long / `[[usize; 13]; 6]` implying 21/12 bands), which would have
+//! silently diverged from the psychoacoustic module's 22/13-band table.
 
-/// Scalefactor band boundaries (in MDCT line index) for long blocks, one
-/// row per supported sample rate (ordered
-/// `[44100, 48000, 32000, 22050, 24000, 16000]` Hz — keep in sync with
-/// [`crate::types::SampleRate`]'s declaration order), 21 bands (22
-/// boundary points) per row.
-///
-/// # ⚠️ Placeholder — not implemented
-///
-/// Zeroed. Must be sourced from ISO/IEC 11172-3 Annex B before use — see
-/// `docs/mp3-encoder/00-overview.md` §4.1 and
-/// `docs/mp3-encoder/13-testing-and-validation.md` §Table provenance.
-pub const SFB_LONG_BOUNDARIES: [[usize; 22]; 6] = [[0; 22]; 6];
-
-/// Scalefactor band boundaries for short blocks (12 bands, 13 boundary
-/// points), same row ordering as [`SFB_LONG_BOUNDARIES`].
-///
-/// # ⚠️ Placeholder — not implemented
-pub const SFB_SHORT_BOUNDARIES: [[usize; 13]; 6] = [[0; 13]; 6];
+pub use crate::psychoacoustic::{SFB_LONG_BOUNDARIES, SFB_SHORT_BOUNDARIES};
 
 /// Per-scalefactor-band scale factors for one granule/channel. Shape
-/// depends on block type: long blocks use up to 21 bands; short blocks
-/// use up to 12 bands × 3 windows. Represented as a flat array sized for
+/// depends on block type: long blocks use up to 22 bands; short blocks
+/// use up to 13 bands × 3 windows. Represented as a flat array sized for
 /// the worst case (short-block layout, which has more total entries);
 /// [`crate::mdct::BlockType`] on the owning
 /// [`crate::quantize::QuantizationResult`] says how to interpret it.
@@ -39,12 +35,27 @@ pub struct ScaleFactors {
     /// Raw scale factor values, before `scalefac_compress`-based bit-width
     /// selection (side info concern, see
     /// `docs/mp3-encoder/11-phase8-bitstream-multiplexing.md` §4).
-    pub values: [u8; 39], // 21 long-block bands, or 12*3=36 short-block (+3 spare not used long)
+    pub values: [u8; 39], // 22 long-block bands, or 13*3=39 short-block
 }
 
 #[cfg(test)]
 mod tests {
-    // TODO(M5): table-provenance test for SFB_LONG_BOUNDARIES /
-    // SFB_SHORT_BOUNDARIES once populated from Annex B. See
-    // docs/mp3-encoder/13-testing-and-validation.md §Table provenance.
+    use super::*;
+
+    // Table-provenance tests for SFB_LONG_BOUNDARIES / SFB_SHORT_BOUNDARIES
+    // themselves (checksum + monotonicity) live in
+    // `psychoacoustic::tables::tests`, next to their single definition —
+    // see the module doc comment above. This test only guards the shape
+    // this module's own consumers (M5's quantization loop) will rely on.
+    #[test]
+    fn reexported_sfb_tables_have_expected_shape() {
+        assert_eq!(SFB_LONG_BOUNDARIES.len(), 6, "one row per sample rate");
+        assert_eq!(SFB_SHORT_BOUNDARIES.len(), 6, "one row per sample rate");
+        for row in &SFB_LONG_BOUNDARIES {
+            assert_eq!(row[row.len() - 1], 576, "long-block rows end at line 576");
+        }
+        for row in &SFB_SHORT_BOUNDARIES {
+            assert_eq!(row[row.len() - 1], 192, "short-block rows end at line 192");
+        }
+    }
 }
