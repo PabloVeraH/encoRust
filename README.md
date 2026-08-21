@@ -1,3 +1,19 @@
+> [!WARNING]
+> # 🚧 UNDER DEVELOPMENT — NOT PRODUCTION READY 🚧
+>
+> **This project is in early development and does NOT yet produce valid
+> MP3 files.** The workspace structure, types, frame headers, polyphase
+> filterbank, MDCT with windowing, and anti-aliasing butterfly are
+> implemented and verified, but the psychoacoustic model, quantization,
+> Huffman coding, bit reservoir, and bitstream assembly are still in
+> progress. **If you need to encode audio to MP3 today, use LAME,
+> Shine, or any other established encoder.** Do not open issues asking
+> when it will be ready — public commits speak for themselves.
+>
+> Curious? Want to contribute? Read the [Status](#status) section.
+>
+> ---
+
 # encoRust
 
 A pure-Rust MPEG-1/2 Layer III (MP3) encoder — no C dependencies, no FFI —
