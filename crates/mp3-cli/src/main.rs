@@ -76,7 +76,15 @@ fn main() {
     };
 
     let rate_control = if let Some(kbps) = args.bitrate {
-        mp3_core::bitstream::RateControl::Cbr(Bitrate::from_kbps(kbps).expect("invalid bitrate"))
+        let bitrate = Bitrate::from_kbps(kbps).unwrap_or_else(|| {
+            eprintln!(
+                "unsupported bitrate {kbps} kbps — see \
+                 docs/mp3-encoder/04-phase1-pcm-io-and-framing.md §2 for \
+                 the legal MPEG-1/LSF values"
+            );
+            std::process::exit(1);
+        });
+        mp3_core::bitstream::RateControl::Cbr(bitrate)
     } else if let Some(q) = args.vbr_quality {
         mp3_core::bitstream::RateControl::Vbr(mp3_core::bitstream::reservoir::VbrQuality(q))
     } else {
