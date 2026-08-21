@@ -3,6 +3,12 @@
 
 use crate::types::SUBBANDS;
 
+// core::f32 has no cos (std-only) — libm is a #![no_std] pure-Rust libm,
+// so `cosf` works identically under both std and --no-default-features.
+// See crates/mp3-core/Cargo.toml's comment on the libm dependency for
+// the M0 no_std/wasm regression this fixes.
+use libm::cosf as cos;
+
 /// Sliding 512-sample analysis buffer + prototype filter application.
 ///
 /// One instance per channel — the 512-sample history is a continuous
@@ -71,7 +77,7 @@ impl PolyphaseFilterbank {
         for (k, sk) in s.iter_mut().enumerate() {
             let mut sum = 0.0;
             for (i, &yi) in y.iter().enumerate() {
-                sum += yi * f32::cos(((2 * k + 1) as f32) * ((i as f32) - 16.0) * PI / 64.0);
+                sum += yi * cos(((2 * k + 1) as f32) * ((i as f32) - 16.0) * PI / 64.0);
             }
             *sk = sum;
         }
