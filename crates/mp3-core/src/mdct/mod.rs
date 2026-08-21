@@ -22,6 +22,12 @@ use core::f32::consts::PI;
 
 use crate::types::SUBBANDS;
 
+// core::f32 has no sin/cos (std-only, via the platform's libm) — libm is
+// itself a #![no_std] pure-Rust libm, so `sinf`/`cosf` work identically
+// under both std and --no-default-features. Use these everywhere in this
+// module instead of the std-only f32::sin/f32::cos methods.
+use libm::{cosf as cos, sinf as sin};
+
 /// Which window shape (and therefore MDCT size) a granule — or, for
 /// mixed blocks, a subband within a granule — uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,7 +51,7 @@ pub enum BlockType {
 pub fn long_window() -> [f32; 36] {
     let mut w = [0.0f32; 36];
     for (i, item) in w.iter_mut().enumerate() {
-        *item = f32::sin(PI / 36.0 * (i as f32 + 0.5));
+        *item = sin(PI / 36.0 * (i as f32 + 0.5));
     }
     w
 }
@@ -55,7 +61,7 @@ pub fn long_window() -> [f32; 36] {
 pub fn short_window() -> [f32; 12] {
     let mut w = [0.0f32; 12];
     for (i, item) in w.iter_mut().enumerate() {
-        *item = f32::sin(PI / 12.0 * (i as f32 + 0.5));
+        *item = sin(PI / 12.0 * (i as f32 + 0.5));
     }
     w
 }
@@ -72,13 +78,13 @@ pub fn short_window() -> [f32; 12] {
 pub fn start_window() -> [f32; 36] {
     let mut w = [0.0f32; 36];
     for i in 0..=17 {
-        w[i] = f32::sin(PI / 36.0 * (i as f32 + 0.5));
+        w[i] = sin(PI / 36.0 * (i as f32 + 0.5));
     }
     for i in 18..=23 {
         w[i] = 1.0;
     }
     for i in 24..=29 {
-        w[i] = f32::sin(PI / 12.0 * ((i - 18) as f32 + 0.5));
+        w[i] = sin(PI / 12.0 * ((i - 18) as f32 + 0.5));
     }
     // 30..=35 stay 0.0
     w
@@ -97,13 +103,13 @@ pub fn stop_window() -> [f32; 36] {
     let mut w = [0.0f32; 36];
     // 0..=5 stay 0.0
     for i in 6..=11 {
-        w[i] = f32::sin(PI / 12.0 * ((i - 6) as f32 + 0.5));
+        w[i] = sin(PI / 12.0 * ((i - 6) as f32 + 0.5));
     }
     for i in 12..=17 {
         w[i] = 1.0;
     }
     for i in 18..=35 {
-        w[i] = f32::sin(PI / 36.0 * (i as f32 + 0.5));
+        w[i] = sin(PI / 36.0 * (i as f32 + 0.5));
     }
     w
 }
@@ -134,7 +140,7 @@ pub fn mdct_36(z: &[f32; 36]) -> [f32; 18] {
         let omega = PI / 36.0 * (2.0 * k as f32 + 1.0);
         let mut sum = 0.0;
         for n in 0..36 {
-            sum += z[n] * f32::cos((n as f32 + 9.5) * omega);
+            sum += z[n] * cos((n as f32 + 9.5) * omega);
         }
         *item = sum;
     }
@@ -150,7 +156,7 @@ pub fn mdct_12(z: &[f32; 12]) -> [f32; 6] {
         let omega = PI / 12.0 * (2.0 * k as f32 + 1.0);
         let mut sum = 0.0;
         for n in 0..12 {
-            sum += z[n] * f32::cos((n as f32 + 3.5) * omega);
+            sum += z[n] * cos((n as f32 + 3.5) * omega);
         }
         *item = sum;
     }
@@ -206,7 +212,7 @@ fn imdct_36(spec: &[f32; 18]) -> [f32; 36] {
         let omega = PI / 36.0 * (n as f32 + 9.5);
         let mut sum = 0.0;
         for k in 0..18 {
-            sum += spec[k] * f32::cos((2.0 * k as f32 + 1.0) * omega);
+            sum += spec[k] * cos((2.0 * k as f32 + 1.0) * omega);
         }
         out[n] = sum * scale;
     }
@@ -222,7 +228,7 @@ fn imdct_12(spec: &[f32; 6]) -> [f32; 12] {
         let omega = PI / 12.0 * (n as f32 + 3.5);
         let mut sum = 0.0;
         for k in 0..6 {
-            sum += spec[k] * f32::cos((2.0 * k as f32 + 1.0) * omega);
+            sum += spec[k] * cos((2.0 * k as f32 + 1.0) * omega);
         }
         out[n] = sum * scale;
     }
@@ -311,7 +317,7 @@ mod tests {
         //       = cos(π/72) ≈ 0.999 ≈ 1.0 — peak is at midpoint
         assert!(w[17] > 0.99, "w[17] should be near 1.0");
         // w[0] = sin(π/36 * 0.5) = sin(π/72) ≈ 0.0436
-        assert!((w[0] - f32::sin(PI / 72.0)).abs() < 1e-6);
+        assert!((w[0] - sin(PI / 72.0)).abs() < 1e-6);
     }
 
     #[test]
@@ -385,9 +391,7 @@ mod tests {
         // 54 samples (3 × 18). Block boundaries at 0, 18, 36, 54.
         let mut signal = [0.0f32; 72]; // 4 × 18
         for i in 0..72 {
-            signal[i] = f32::sin(i as f32 * 0.7)
-                + 0.5 * f32::sin(i as f32 * 2.1)
-                + 0.3 * f32::cos(i as f32 * 0.3);
+            signal[i] = sin(i as f32 * 0.7) + 0.5 * sin(i as f32 * 2.1) + 0.3 * cos(i as f32 * 0.3);
         }
 
         let w = long_window();
@@ -429,7 +433,7 @@ mod tests {
     fn short_mdct_perfect_reconstruction() {
         let mut signal = [0.0f32; 24]; // 4 × 6
         for i in 0..24 {
-            signal[i] = f32::cos(i as f32 * 1.3) * 0.7;
+            signal[i] = cos(i as f32 * 1.3) * 0.7;
         }
 
         let w = short_window();
@@ -488,7 +492,7 @@ mod tests {
         use core::f32::consts::PI;
         let mut z = [0.0f32; 36];
         for i in 0..36 {
-            z[i] = f32::sin((i as f32) * PI / 18.0);
+            z[i] = sin((i as f32) * PI / 18.0);
         }
         let spec = mdct_36(&z);
         let input_energy: f32 = z.iter().map(|v| v * v).sum();

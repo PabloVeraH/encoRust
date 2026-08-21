@@ -8,6 +8,14 @@ description = "Pure-Rust MPEG-1/2 Layer III (MP3) encoder core — no I/O, no_st
 
 [dependencies]
 thiserror = { workspace = true, default-features = false }
+# core::f32 has no sin/cos/etc. (those are std-only, backed by the
+# platform's libm) — libm is itself a #![no_std] pure-Rust libm, so it
+# works identically under --no-default-features. Needed by every
+# trigonometric formula in filterbank/ and mdct/ (windows, MDCT itself,
+# the polyphase cosine matrix). See docs/mp3-encoder/verification/ M0
+# regression this fixes: build-wasm silently broke once M2/M3 added
+# these calls via f32::sin/f32::cos, which only resolve under `std`.
+libm = { version = "0.2", default-features = false }
 
 [features]
 default = ["std"]
