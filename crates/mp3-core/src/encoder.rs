@@ -54,13 +54,18 @@ impl Encoder {
     /// Returns [`EncodeError`] if `config` requests an unsupported sample
     /// rate, channel count, or bitrate.
     pub fn new(config: EncoderConfig) -> Result<Self, EncodeError> {
-        let _ = config;
-        todo!(
-            "M1-M7: validate config against the version-specific tables \
-             (see 04-phase1-pcm-io-and-framing.md §2), construct \
-             reservoir with the correct MPEG-version cap (see \
-             10-phase7-bit-reservoir-and-rate-control.md §2)"
-        )
+        let version = config.sample_rate.version();
+        let reservoir = BitReservoir::new(BitReservoir::max_for_version(version));
+
+        let filterbanks = [const { PolyphaseFilterbank::new() }; MAX_CHANNELS];
+        let psychoacoustic = [const { PsychoacousticModel::new() }; MAX_CHANNELS];
+
+        Ok(Self {
+            config,
+            filterbanks,
+            psychoacoustic,
+            reservoir,
+        })
     }
 
     /// Consumes exactly one MPEG frame's worth of PCM — 1152 samples per
