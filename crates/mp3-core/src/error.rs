@@ -40,4 +40,18 @@ pub enum EncodeError {
         /// The rejected bitrate, in kbps.
         kbps: u32,
     },
+
+    /// The requested [`crate::types::ChannelMode`] is valid per the
+    /// standard but this encoder doesn't implement it yet: joint stereo
+    /// (MS/intensity) needs a cross-channel transform applied before
+    /// quantization (chapter 08) that doesn't exist yet -- encoding
+    /// content as `JointStereoMs`/`JointStereoIntensity` without it would
+    /// produce a frame whose header claims a joint-stereo transform that
+    /// was never applied, which a real decoder would misinterpret. Fail
+    /// loudly here rather than silently emit that.
+    #[error("channel mode not yet implemented by this encoder: {mode:?}")]
+    UnsupportedChannelMode {
+        /// The rejected channel mode.
+        mode: crate::types::ChannelMode,
+    },
 }

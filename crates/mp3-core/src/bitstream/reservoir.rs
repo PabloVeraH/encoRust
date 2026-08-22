@@ -26,6 +26,20 @@ pub enum RateControl {
     Vbr(VbrQuality),
 }
 
+impl RateControl {
+    /// Returns the nominal bitrate for this rate-control mode.
+    /// For CBR and ABR, this is the target bitrate. For VBR, returns a
+    /// default of 128 kbps (used for frame-size calculation; actual
+    /// per-frame bitrate varies).
+    #[must_use]
+    pub fn nominal_bitrate(self) -> Bitrate {
+        match self {
+            Self::Cbr(br) | Self::Abr(br) => br,
+            Self::Vbr(_) => Bitrate::Kbps128,
+        }
+    }
+}
+
 /// VBR quality target. Scale/meaning TBD at implementation time (a
 /// LAME-`-V`-style 0-9 scale is a reasonable, well-precedented choice —
 /// see `docs/mp3-encoder/02-standards-and-prior-art.md` §4 on borrowing

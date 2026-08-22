@@ -3,6 +3,7 @@
 //! `docs/mp3-encoder/11-phase8-bitstream-multiplexing.md`.
 
 pub mod reservoir;
+pub mod scalefactor_encode;
 pub mod side_info;
 pub mod writer;
 

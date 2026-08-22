@@ -50,164 +50,227 @@ fn sf_band_end() -> [usize; SF_BAND_COUNT] {
     end
 }
 
-/// Estimate the number of bits needed to encode a region with a given table.
+/// Cost, in bits, of encoding `ix[start..end]` (paired) using exactly
+/// `table_id` for every pair in the region -- or `None` if some pair's
+/// magnitude exceeds what this table (with its escape mechanism, if any)
+/// can represent at all, meaning `table_id` isn't a valid choice for this
+/// region.
 ///
-/// Escape handling mirrors [`encode_granule`]'s real emission exactly (see
-/// that function's doc comment for the derivation) -- this used to trigger
-/// escape at `ax >= xlen` and always cost a hardcoded 16 bits using the
-/// `(xlen-1, xlen-1)` corner code, both wrong in the same way
-/// `encode_granule`'s bit-emission was; keeping the two in sync matters
-/// because this is also what `choose_table`'s exhaustive search compares
-/// candidates against.
-fn estimate_bits_for_region(ix: &[i32], start: usize, end: usize, linbits: u8) -> u32 {
-    let mut bits: u32 = 0;
-    let mut i = start;
+/// This costs the region **as a whole, against one committed table** --
+/// matching how `big_values` sub-regions actually work (chapter 09 §1:
+/// one table per sub-region, not a free per-pair choice). An earlier
+/// version (`estimate_bits_for_region`) ignored which table it was
+/// supposedly costing and instead ran its own independent per-pair
+/// "cheapest of all 15 tables" search every time -- since a region
+/// constrained to one table can never beat the sum of independent
+/// per-pair minimums, that structurally *under-counted* relative to what
+/// [`encode_granule`] actually emits (confirmed empirically: a granule
+/// that estimated 1426 bits produced 2024 real bits, a 42% undercount,
+/// silently overflowing the caller's bit budget). It also made
+/// `choose_table`'s "exhaustive search" pointless, since every candidate
+/// got the same answer regardless of which table was being evaluated.
+///
+/// Escape handling matches [`encode_granule`]'s real emission exactly
+/// (see that function's doc comment for the threshold/lookup
+/// derivation).
+fn region_cost_with_table(ix: &[i32], start: usize, end: usize, table_id: u8) -> Option<u32> {
+    let (vlc_idx, linbits) = BIG_VALUES_TABLES[table_id as usize]?;
+    let table = &VLC_TABLES[vlc_idx];
+    if table.xlen == 0 {
+        // Table 0 (trivially empty): only valid for an empty region.
+        return if start >= end { Some(0) } else { None };
+    }
+    let xlen = table.xlen;
+    let esc_threshold = xlen - 1;
+    let max_rep = if linbits > 0 {
+        esc_threshold + ((1usize << linbits) - 1)
+    } else {
+        esc_threshold
+    };
 
+    let mut bits = 0u32;
+    let mut i = start;
     while i + 1 < end {
         let ax = ix[i].unsigned_abs() as usize;
         let ay = ix[i + 1].unsigned_abs() as usize;
         i += 2;
 
-        // Try to find a table that covers this pair
-        let mut found = false;
-        for table_id in 1u8..=15 {
-            if let Some(info) = BIG_VALUES_TABLES[table_id as usize] {
-                let vlc_idx = info.0;
-                let table_linbits = info.1;
-                let table = &VLC_TABLES[vlc_idx];
-                if table.xlen == 0 {
-                    continue;
-                }
-                let xlen = table.xlen;
-                if table_linbits == 0 {
-                    // No escape mechanism at all for this table -- only a
-                    // candidate if both coordinates fit directly.
-                    if ax < xlen && ay < xlen {
-                        bits += table.lookup(ax, ay).bits as u32;
-                        found = true;
-                        break;
-                    }
-                } else {
-                    let esc_threshold = xlen - 1;
-                    let linbits_limit = 1usize << table_linbits;
-                    let max_rep = esc_threshold + (linbits_limit - 1);
-                    if ax <= max_rep && ay <= max_rep {
-                        let ax_c = ax.min(esc_threshold);
-                        let ay_c = ay.min(esc_threshold);
-                        bits += table.lookup(ax_c, ay_c).bits as u32;
-                        if ax >= esc_threshold {
-                            bits += table_linbits as u32;
-                        }
-                        if ay >= esc_threshold {
-                            bits += table_linbits as u32;
-                        }
-                        if ax != 0 {
-                            bits += 1; // sign
-                        }
-                        if ay != 0 {
-                            bits += 1; // sign
-                        }
-                        found = true;
-                        break;
-                    }
-                }
+        if ax > max_rep || ay > max_rep {
+            return None;
+        }
+        if linbits > 0 && (ax >= esc_threshold || ay >= esc_threshold) {
+            let ax_c = ax.min(esc_threshold);
+            let ay_c = ay.min(esc_threshold);
+            bits += table.lookup(ax_c, ay_c).bits as u32;
+            if ax >= esc_threshold {
+                bits += linbits as u32;
             }
-        }
-        if !found {
-            bits += 32; // conservative fallback -- no candidate table covers
-                        // this pair at all (shouldn't happen for in-range ix
-                        // values); over-estimate generously rather than
-                        // silently under-count.
-        }
-        let _ = linbits;
-    }
-
-    bits
-}
-
-/// Fast, allocation-free bit-count estimate for the quantization inner
-/// loop ([`crate::quantize::loop_control::quantize_granule`]). Must
-/// over-estimate rather than under-estimate on ties, so the inner loop
-/// never produces a bitstream that overflows its budget once
-/// [`encode_granule`] runs for real. See
-/// `docs/mp3-encoder/09-phase6-huffman-coding.md` §4.
-#[must_use]
-pub fn estimate_bits(ix: &[i32; SAMPLES_PER_GRANULE]) -> u32 {
-    let mut bits: u32 = 0;
-    let mut i = 0;
-    while i + 1 < SAMPLES_PER_GRANULE {
-        let ax = ix[i].unsigned_abs() as usize;
-        let ay = ix[i + 1].unsigned_abs() as usize;
-
-        // Quick check: can table 1 (xlen=2) handle this?
-        if ax < 2 && ay < 2 {
-            bits += VLC_TABLES[1].lookup(ax, ay).bits as u32;
+            if ay >= esc_threshold {
+                bits += linbits as u32;
+            }
         } else {
-            // Conservative estimate for larger values
-            bits += estimate_bits_for_region(ix, i, i + 2, 0);
+            bits += table.lookup(ax, ay).bits as u32;
         }
-        i += 2;
+        if ax != 0 {
+            bits += 1; // sign
+        }
+        if ay != 0 {
+            bits += 1; // sign
+        }
     }
-    bits
+    Some(bits)
 }
 
-/// Choose the best Huffman table for a given region of ix[] values.
-/// Returns the table_id (1..=31).
-fn choose_table(ix: &[i32], start: usize, end: usize) -> u8 {
-    if start >= end {
-        return 0;
+/// Finds the table_id minimizing [`region_cost_with_table`] for this
+/// region, and that minimum cost. Returns `(0, 0)` for an empty or
+/// all-zero region (table 0, no bits).
+fn choose_table_and_cost(ix: &[i32], start: usize, end: usize) -> (u8, u32) {
+    if start >= end || ix[start..end].iter().all(|&v| v == 0) {
+        return (0, 0);
     }
 
-    let mut max_val: i32 = 0;
-    let mut any_nonzero = false;
-    for &v in &ix[start..end] {
-        let a = v.abs();
-        if a > max_val {
-            max_val = a;
-        }
-        if v != 0 {
-            any_nonzero = true;
-        }
-    }
-
-    if !any_nonzero {
-        return 0;
-    }
-
-    let mut best_table: u8 = 1;
+    let mut best_table = 1u8;
     let mut best_bits = u32::MAX;
-
     for table_id in 1u8..=31 {
-        if let Some(info) = BIG_VALUES_TABLES[table_id as usize] {
-            let vlc_idx = info.0;
-            let linbits = info.1;
-            let table = &VLC_TABLES[vlc_idx];
-            if table.xlen == 0 {
-                continue;
-            }
-            let xlen = table.xlen as i32;
-            // Non-escape tables (linbits == 0): only 0..=(xlen-1) directly.
-            // Escape tables: the linbits field can add 0..=(2^linbits - 1)
-            // on top of the (xlen-1) escape threshold -- an earlier
-            // version added the full 2^linbits (one too many), matching
-            // the encoder's own off-by-one at the escape boundary.
-            let max_representable = if linbits > 0 {
-                (xlen - 1) + ((1i32 << linbits) - 1)
-            } else {
-                xlen - 1
-            };
-            if max_val > max_representable {
-                continue;
-            }
-            let bits = estimate_bits_for_region(ix, start, end, linbits);
+        if let Some(bits) = region_cost_with_table(ix, start, end, table_id) {
             if bits < best_bits {
                 best_bits = bits;
                 best_table = table_id;
             }
         }
     }
+    (best_table, best_bits)
+}
 
-    best_table
+/// Choose the best Huffman table for a given region of ix[] values.
+/// Returns the table_id (0..=31; 0 means "empty, no bits").
+fn choose_table(ix: &[i32], start: usize, end: usize) -> u8 {
+    choose_table_and_cost(ix, start, end).0
+}
+
+/// Real cost of the count1 region `ix[start..end]` using whichever of the
+/// two count1 tables is cheaper, plus sign bits. Returns
+/// `(use_table_b, total_bits)`. Shared by [`estimate_bits`] (as a real
+/// cost, not a heuristic -- count1 quadruple coding is cheap enough to
+/// compute exactly) and [`encode_granule`] (for the actual table
+/// selection).
+fn count1_region_cost(ix: &[i32], start: usize, end: usize) -> (bool, u32) {
+    if start >= end {
+        return (false, 0);
+    }
+
+    let mut bits0 = 0u32;
+    let mut bits1 = 0u32;
+    let mut pos = start;
+    while pos + 3 < end {
+        let quad = [ix[pos], ix[pos + 1], ix[pos + 2], ix[pos + 3]];
+        let idx = signed_to_index(quad[0]) * 8
+            + signed_to_index(quad[1]) * 4
+            + signed_to_index(quad[2]) * 2
+            + signed_to_index(quad[3]);
+        bits0 += COUNT1_TABLES[0].entries[idx].bits as u32;
+        bits1 += COUNT1_TABLES[1].entries[idx].bits as u32;
+        let signs = quad.iter().filter(|&&v| v != 0).count() as u32;
+        bits0 += signs;
+        bits1 += signs;
+        pos += 4;
+    }
+
+    let rem_count = end - pos;
+    if rem_count > 0 {
+        let mut quad = [0i32; 4];
+        quad[..rem_count].copy_from_slice(&ix[pos..end]);
+        let idx = signed_to_index(quad[0]) * 8
+            + signed_to_index(quad[1]) * 4
+            + signed_to_index(quad[2]) * 2
+            + signed_to_index(quad[3]);
+        bits0 += COUNT1_TABLES[0].entries[idx].bits as u32;
+        bits1 += COUNT1_TABLES[1].entries[idx].bits as u32;
+        let signs = quad[..rem_count].iter().filter(|&&v| v != 0).count() as u32;
+        bits0 += signs;
+        bits1 += signs;
+    }
+
+    if bits1 <= bits0 {
+        (true, bits1)
+    } else {
+        (false, bits0)
+    }
+}
+
+/// The `big_values`/`count1`/`rzero` region boundaries for one granule,
+/// per chapter 09 §1. Shared by [`estimate_bits`] and [`encode_granule`]
+/// so the estimator actually costs the same regions the real encoder
+/// commits to -- an earlier version had `estimate_bits` cost the entire
+/// granule as one undifferentiated run of pairs, which doesn't resemble
+/// what gets emitted closely enough to be a tight estimate.
+struct Regions {
+    big_values_end: usize,
+    count1_end: usize,
+    r0_end: usize,
+    r1_end: usize,
+}
+
+fn compute_regions(ix: &[i32; SAMPLES_PER_GRANULE]) -> Regions {
+    // Find count1 region: walk backwards to find the last non-zero value.
+    let mut count1_end = SAMPLES_PER_GRANULE;
+    while count1_end > 0 && ix[count1_end - 1] == 0 {
+        count1_end -= 1;
+    }
+
+    // Find where big_values ends: the last sample with |val| > 1.
+    let mut big_values_end = 0usize;
+    for (i, &v) in ix.iter().enumerate() {
+        if v.abs() > 1 {
+            big_values_end = i + 1;
+        }
+    }
+    big_values_end = (big_values_end + 1) & !1;
+    if big_values_end > SAMPLES_PER_GRANULE {
+        big_values_end = SAMPLES_PER_GRANULE;
+    }
+
+    // Rounding big_values_end up to the next even index can push it
+    // *past* count1_end -- see the M6 review notes (this is the fix for
+    // the proptest-found panic pinned in
+    // proptest-regressions/huffman/encode.txt).
+    count1_end = count1_end.max(big_values_end);
+
+    let pairs_count = big_values_end / 2;
+    let third = pairs_count / 3;
+
+    Regions {
+        big_values_end,
+        count1_end,
+        r0_end: third * 2,
+        r1_end: third * 4,
+    }
+}
+
+/// Bit-count estimate for the quantization inner loop
+/// ([`crate::quantize::loop_control::quantize_granule`]). Must
+/// over-estimate rather than under-estimate on ties, so the inner loop
+/// never produces a bitstream that overflows its budget once
+/// [`encode_granule`] runs for real -- this mirrors `encode_granule`'s
+/// actual region splitting and per-region table costing exactly (see
+/// [`region_cost_with_table`]'s doc comment for why a cheaper, per-pair
+/// heuristic silently violated that contract). See
+/// `docs/mp3-encoder/09-phase6-huffman-coding.md` §4.
+#[must_use]
+pub fn estimate_bits(ix: &[i32; SAMPLES_PER_GRANULE]) -> u32 {
+    let regions = compute_regions(ix);
+
+    let mut bits = 0u32;
+    for &(start, end) in &[
+        (0, regions.r0_end),
+        (regions.r0_end, regions.r1_end),
+        (regions.r1_end, regions.big_values_end),
+    ] {
+        bits += choose_table_and_cost(ix, start, end).1;
+    }
+    bits += count1_region_cost(ix, regions.big_values_end, regions.count1_end).1;
+
+    bits
 }
 
 /// Map a signed value to unsigned index for count1 encoding:
@@ -230,60 +293,6 @@ fn count_sf_bands_for_pairs(pairs: usize, band_end: &[usize; SF_BAND_COUNT]) -> 
     SF_BAND_COUNT
 }
 
-/// Choose between the two count1 tables.
-fn choose_count1_table(ix: &[i32], start: usize, end: usize) -> bool {
-    // Defensive: `end - pos` below would underflow if `start > end`.
-    // `encode_granule` guarantees `count1_start <= count1_end` itself
-    // now (see its own comment on the rounding edge case that used to
-    // violate this), but this function has its own preconditions to
-    // uphold regardless of what a future caller passes.
-    if start >= end {
-        return false;
-    }
-
-    let mut bits0: u32 = 0;
-    let mut bits1: u32 = 0;
-
-    let mut pos = start;
-    while pos + 3 < end {
-        let v = signed_to_index(ix[pos]);
-        let w = signed_to_index(ix[pos + 1]);
-        let x = signed_to_index(ix[pos + 2]);
-        let y = signed_to_index(ix[pos + 3]);
-        pos += 4;
-        let idx = v * 8 + w * 4 + x * 2 + y;
-        bits0 += COUNT1_TABLES[0].entries[idx].bits as u32;
-        bits1 += COUNT1_TABLES[1].entries[idx].bits as u32;
-    }
-
-    let mut remaining = [0i32; 4];
-    let rem_count = end - pos;
-    remaining[..rem_count].copy_from_slice(&ix[pos..pos + rem_count]);
-    if rem_count > 0 {
-        let v = signed_to_index(remaining[0]);
-        let w = if rem_count > 1 {
-            signed_to_index(remaining[1])
-        } else {
-            0
-        };
-        let x = if rem_count > 2 {
-            signed_to_index(remaining[2])
-        } else {
-            0
-        };
-        let y = if rem_count > 3 {
-            signed_to_index(remaining[3])
-        } else {
-            0
-        };
-        let idx = v * 8 + w * 4 + x * 2 + y;
-        bits0 += COUNT1_TABLES[0].entries[idx].bits as u32;
-        bits1 += COUNT1_TABLES[1].entries[idx].bits as u32;
-    }
-
-    bits1 <= bits0
-}
-
 /// Full Huffman encode: region splitting + exhaustive per-region table
 /// selection + `count1` region + escape (`linbits`) handling, emitting
 /// bits via `writer`. Called once per granule, after the quantization
@@ -294,35 +303,9 @@ pub fn encode_granule(
     writer: &mut BitWriter<'_>,
 ) -> HuffmanSideInfo {
     let band_end = sf_band_end();
-
-    // Find count1 region: walk backwards to find the last non-zero value
-    let mut count1_end = SAMPLES_PER_GRANULE;
-    while count1_end > 0 && ix[count1_end - 1] == 0 {
-        count1_end -= 1;
-    }
-
-    // Find where big_values ends: the last sample with |val| > 1
-    let mut big_values_end = 0usize;
-    for (i, &v) in ix.iter().enumerate() {
-        if v.abs() > 1 {
-            big_values_end = i + 1;
-        }
-    }
-    big_values_end = (big_values_end + 1) & !1;
-    if big_values_end > SAMPLES_PER_GRANULE {
-        big_values_end = SAMPLES_PER_GRANULE;
-    }
-
-    // Rounding big_values_end up to the next even index can push it
-    // *past* count1_end: e.g. the last nonzero value in the whole
-    // spectrum has magnitude > 1 (needs big_values) and sits at an odd
-    // index -- count1_end stops right after it, but big_values_end
-    // rounds one further. When that happens there's no count1 region
-    // left at all (everything nonzero is already inside the
-    // now-extended big_values region, even though its rounding-padded
-    // pair-mate is zero); without this, `count1_end - count1_start`
-    // below underflows (`count1_start = big_values_end > count1_end`).
-    count1_end = count1_end.max(big_values_end);
+    let regions = compute_regions(ix);
+    let big_values_end = regions.big_values_end;
+    let count1_end = regions.count1_end;
 
     let big_values_count = (big_values_end / 2) as u16;
 
@@ -333,9 +316,9 @@ pub fn encode_granule(
     let region1_count = count_sf_bands_for_pairs(third * 2, &band_end) as u8;
 
     let r0_start = 0;
-    let r0_end = third * 2;
+    let r0_end = regions.r0_end;
     let r1_start = r0_end;
-    let r1_end = third * 4;
+    let r1_end = regions.r1_end;
     let r2_start = r1_end;
     let r2_end = big_values_end;
 
@@ -414,7 +397,7 @@ pub fn encode_granule(
 
     // Encode count1 region
     let count1_start = big_values_end;
-    let use_table_1 = choose_count1_table(ix, count1_start, count1_end);
+    let (use_table_1, _) = count1_region_cost(ix, count1_start, count1_end);
     let count1_table = &COUNT1_TABLES[if use_table_1 { 1 } else { 0 }];
 
     let mut pos = count1_start;
@@ -490,24 +473,92 @@ mod tests {
     use alloc::vec::Vec;
     use proptest::prelude::*;
 
+    /// `estimate_bits` predicts the *raw* bit count `encode_granule`
+    /// emits; the only thing `out.len() * 8` can legitimately add on top
+    /// is `BitWriter::flush`'s zero-padding up to the next byte boundary
+    /// (0..=7 bits) -- not a fudge factor, a hard bound following
+    /// directly from `flush`'s own definition. Comparing the two without
+    /// that allowance would fail even for a perfectly exact estimator.
+    const FLUSH_PADDING_SLOP_BITS: u32 = 7;
+
+    fn assert_estimate_never_undercounts(ix: &[i32; SAMPLES_PER_GRANULE]) {
+        let estimate = estimate_bits(ix);
+
+        let mut out = Vec::new();
+        let mut writer = BitWriter::new(&mut out);
+        let _info = encode_granule(ix, &mut writer);
+        writer.flush();
+        let actual_bits = (out.len() * 8) as u32;
+
+        assert!(
+            estimate + FLUSH_PADDING_SLOP_BITS >= actual_bits,
+            "estimate ({estimate}) is more than {FLUSH_PADDING_SLOP_BITS} \
+             bits (the max possible flush-padding) below actual \
+             ({actual_bits}) -- estimate_bits is under-counting the real \
+             region-committed Huffman cost"
+        );
+    }
+
     #[test]
     fn estimate_bits_never_undercounts() {
         let mut ix = [0i32; SAMPLES_PER_GRANULE];
         for (i, item) in ix.iter_mut().enumerate().take(100) {
             *item = (i as i32 % 7) - 3;
         }
+        assert_estimate_never_undercounts(&ix);
+    }
 
+    #[test]
+    fn estimate_bits_never_undercounts_broadband_noise() {
+        // Regression test for the bug this review found: a per-pair
+        // "cheapest of all 15 tables" heuristic (an earlier version of
+        // `estimate_bits`) structurally undercounts relative to the real
+        // encoder, which commits one table per whole region -- confirmed
+        // empirically on content shaped like this (128kbps granule of
+        // moderate broadband noise): estimate_bits predicted 1426 bits,
+        // encode_granule's real output was 2024 -- a 42% undercount that
+        // silently overflowed the caller's bit budget in M8's pipeline.
+        // The earlier `estimate_bits_never_undercounts` test above only
+        // covers 100 small values (magnitude <= 3), never broad enough
+        // content to trigger this.
+        let mut seed: u32 = 12345;
+        let mut ix = [0i32; SAMPLES_PER_GRANULE];
+        for v in ix.iter_mut() {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            let raw = (seed >> 24) as i32 - 128; // roughly -128..127
+            *v = raw / 4; // keep magnitudes realistic for a quantized granule
+        }
+        assert_estimate_never_undercounts(&ix);
+    }
+
+    #[test]
+    fn estimate_bits_is_tight_not_just_safe() {
+        // A structurally-safe-but-loose over-estimate (e.g. "assume the
+        // biggest possible table for everything") would also pass the
+        // never-undercounts tests above without actually fixing the
+        // problem those bugs cause downstream (an inner loop trusting a
+        // wildly loose estimate coarsens quantization far more than
+        // necessary). Confirm the estimate is *close* to real, not just
+        // safely above it -- within flush-padding slop plus a small
+        // margin for legitimately-suboptimal-but-valid table choices.
+        let mut seed: u32 = 999;
+        let mut ix = [0i32; SAMPLES_PER_GRANULE];
+        for v in ix.iter_mut() {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            *v = ((seed >> 24) as i32 - 128) / 4;
+        }
         let estimate = estimate_bits(&ix);
-
         let mut out = Vec::new();
         let mut writer = BitWriter::new(&mut out);
-        let _info = encode_granule(&ix, &mut writer);
+        encode_granule(&ix, &mut writer);
         writer.flush();
-        let actual_bits = (out.len() * 8) as u32;
+        let actual = (out.len() * 8) as u32;
 
+        assert!(estimate >= actual.saturating_sub(FLUSH_PADDING_SLOP_BITS));
         assert!(
-            estimate >= actual_bits,
-            "estimate ({estimate}) < actual ({actual_bits})"
+            estimate < actual + 32,
+            "estimate ({estimate}) is suspiciously far above actual \
+             ({actual}) for a tight estimator"
         );
     }
 
@@ -731,7 +782,7 @@ mod tests {
         // that rounding `big_values_end` up to an even boundary pushes
         // it one past `count1_end` (the last-nonzero position). Before
         // the fix, `count1_start(=big_values_end) > count1_end` made
-        // `end - pos` underflow (panic) in `choose_count1_table` and the
+        // `end - pos` underflow (panic) in `count1_region_cost` and the
         // count1 emission loop. This value/position is the shrunk
         // failing case verbatim.
         let mut ix = [0i32; SAMPLES_PER_GRANULE];
