@@ -341,7 +341,7 @@ impl PsychoacousticModel {
             );
 
             // Tonality = 1 - unpredictability, clamped to [0, 1]
-            tonality[i] = (1.0 - cw).clamp(0.0, 1.0);
+            tonality[i] = (1.0_f32 - cw).clamp(0.0, 1.0);
         }
 
         tonality

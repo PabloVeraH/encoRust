@@ -11,4 +11,4 @@ pub mod encode;
 pub mod tables;
 
 pub use encode::{encode_granule, estimate_bits};
-pub use tables::{HuffmanTable, HuffmanTree};
+pub use tables::{Count1Table, HuffmanTable, VlcEntry};
