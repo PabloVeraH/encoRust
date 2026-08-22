@@ -339,4 +339,10 @@ impl ChannelMode {
             _ => 0b00,
         }
     }
+
+    /// Whether this mode uses two coded channels (stereo, joint, or dual).
+    #[must_use]
+    pub const fn is_stereo(self) -> bool {
+        self.channel_count() > 1
+    }
 }
