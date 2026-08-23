@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>mp3-wasm streaming harness</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 2rem auto; }
+  button { font-size: 1rem; padding: 0.5rem 1rem; }
+  pre { background: #f0f0f0; padding: 0.75rem; overflow-x: auto; }
+  .ok { color: #0a7a0a; }
+  .err { color: #b00020; }
+</style>
+</head>
+<body>
+<h1>mp3-wasm streaming harness</h1>
+<p>
+  Demonstrates the M9 Definition of Done requirement: push PCM chunks
+  <em>smaller than one MP3 frame</em> (128 samples, the typical
+  <code>AudioWorklet</code> <code>process()</code> callback size — much
+  smaller than a frame's 1152 MPEG-1 samples/channel) into
+  <code>WasmEncoder</code> on an interval unrelated to frame boundaries,
+  and confirm correctly-framed MP3 bytes come back out.
+  See <code>docs/mp3-encoder/12-phase9-cli-and-wasm.md</code> §2/§4.
+</p>
+<button id="run">Run streaming encode</button>
+<pre id="log">(click "Run streaming encode")</pre>
+<audio id="player" controls style="display:none; width:100%; margin-top:1rem;"></audio>
+
+<script type="module">
+  // Standard `wasm-pack build --target web` output shape. Build first:
+  //   cd crates/mp3-wasm && wasm-pack build --target web --out-dir examples/streaming-harness/pkg
+  // then serve this directory (e.g. `python3 -m http.server`) and open
+  // index.html — opening the file directly (file://) will not work,
+  // ES module imports and wasm fetch both require an http(s) origin.
+  import init, { WasmEncoder } from "./pkg/mp3_wasm.js";
+
+  const log = document.getElementById("log");
+  const player = document.getElementById("player");
+  const append = (line, cls) => {
+    const span = document.createElement("div");
+    if (cls) span.className = cls;
+    span.textContent = line;
+    log.appendChild(span);
+  };
+
+  /** One MPEG-1 frame's worth of samples for 44.1 kHz/stereo. */
+  const SAMPLE_RATE = 44_100;
+  const CHANNELS = 2;
+  const BITRATE_KBPS = 128;
+  const FRAME_SAMPLES = 1152; // per channel, MPEG-1
+
+  /** AudioWorklet's real chunk size — far smaller than one frame, and
+   *  not a divisor of it, so pushes land mid-frame on purpose. */
+  const CHUNK_SAMPLES = 128;
+
+  /** Generates one interleaved-stereo chunk of a simple two-tone mix
+   *  (not silence — see mp3-core's own testing notes on why silence
+   *  doesn't meaningfully exercise an encoder: it compresses to
+   *  near-zero bits regardless of whether framing/budgeting works). */
+  function makeChunk(startFrame, nFrames) {
+    const out = new Float32Array(nFrames * CHANNELS);
+    for (let i = 0; i < nFrames; i++) {
+      const t = (startFrame + i) / SAMPLE_RATE;
+      const l = 0.2 * Math.sin(2 * Math.PI * 440 * t);
+      const r = 0.2 * Math.sin(2 * Math.PI * 554 * t);
+      out[i * 2] = l;
+      out[i * 2 + 1] = r;
+    }
+    return out;
+  }
+
+  function looksLikeMpeg1Layer3(bytes) {
+    if (bytes.length < 4) return false;
+    const header = (bytes[0] << 24) | (bytes[1] << 16) | (bytes[2] << 8) | bytes[3];
+    const syncword = (header >>> 21) & 0x7ff;
+    const version = (header >>> 19) & 0x3;
+    const layer = (header >>> 17) & 0x3;
+    return syncword === 0x7ff && version === 0b11 && layer === 0b01;
+  }
+
+  document.getElementById("run").addEventListener("click", async () => {
+    log.innerHTML = "";
+    try {
+      await init();
+      const encoder = new WasmEncoder(SAMPLE_RATE, CHANNELS, BITRATE_KBPS);
+      append(`WasmEncoder constructed: ${SAMPLE_RATE} Hz, ${CHANNELS}ch, ${BITRATE_KBPS} kbps`);
+
+      const totalDurationSeconds = 2;
+      const totalSamples = SAMPLE_RATE * totalDurationSeconds;
+      const chunks = [];
+      let pushedSamples = 0;
+      while (pushedSamples < totalSamples) {
+        const n = Math.min(CHUNK_SAMPLES, totalSamples - pushedSamples);
+        chunks.push(makeChunk(pushedSamples, n));
+        pushedSamples += n;
+      }
+      append(`Generated ${chunks.length} chunks of ${CHUNK_SAMPLES} samples each ` +
+             `(1 MP3 frame = ${FRAME_SAMPLES} samples/channel -- chunks never align to it)`);
+
+      let mp3Bytes = [];
+      let framesSeenSoFar = 0;
+      for (const chunk of chunks) {
+        // push() returns a Result<Vec<u8>, JsValue> on the Rust side --
+        // wasm-bindgen surfaces the Err case as a thrown JS exception,
+        // which propagates out of this loop instead of silently
+        // vanishing (the exact bug the M9 review fixed: an earlier
+        // version of push() swallowed encode errors and returned
+        // nothing forever with no signal at all).
+        const out = encoder.push(chunk);
+        if (out.length > 0) {
+          mp3Bytes.push(out);
+          framesSeenSoFar++;
+        }
+      }
+      const finalBytes = encoder.finish();
+      if (finalBytes.length > 0) mp3Bytes.push(finalBytes);
+
+      const total = mp3Bytes.reduce((n, b) => n + b.length, 0);
+      const assembled = new Uint8Array(total);
+      let offset = 0;
+      for (const b of mp3Bytes) {
+        assembled.set(b, offset);
+        offset += b.length;
+      }
+
+      append(`Received ${framesSeenSoFar} completed-frame flush(es) from push(), ` +
+             `${assembled.length} total MP3 bytes`);
+
+      if (looksLikeMpeg1Layer3(assembled)) {
+        append("✓ Output starts with a valid MPEG-1 Layer III frame header", "ok");
+      } else {
+        append("✗ Output does NOT look like a valid MP3 frame", "err");
+      }
+
+      const blob = new Blob([assembled], { type: "audio/mpeg" });
+      player.src = URL.createObjectURL(blob);
+      player.style.display = "block";
+      append("Playable below (also confirms a real browser MP3 decoder accepts it).");
+    } catch (e) {
+      append(`✗ Error: ${e}`, "err");
+      throw e;
+    }
+  });
+</script>
+</body>
+</html>

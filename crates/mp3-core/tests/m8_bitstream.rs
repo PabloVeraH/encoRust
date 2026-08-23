@@ -179,6 +179,30 @@ fn rejects_joint_stereo_modes() {
     }
 }
 
+/// Found during the M9 review: `Encoder::new`'s own doc comment already
+/// promised to reject an unsupported bitrate, but nothing actually
+/// checked it -- `Bitrate::header_index` returns `None` for bitrates
+/// that are legal for the *other* MPEG version (144 kbps is LSF-only,
+/// 320 kbps is MPEG-1-only), and that mismatch went uncaught until deep
+/// inside the first `encode_frame` call's `FrameHeader::to_bits()`. A
+/// caller that doesn't loudly surface a rare `encode_frame` error (e.g.
+/// `mp3-wasm`'s `WasmEncoder`, before this same review fixed it) would
+/// then silently produce nothing forever. Reject at construction, where
+/// every caller already handles a `Result`.
+#[test]
+fn rejects_bitrate_invalid_for_version() {
+    // 144 kbps only has a header_index for MPEG-2 LSF, not MPEG-1.
+    let config = EncoderConfig {
+        sample_rate: SampleRate::Hz44100, // MPEG-1
+        channel_mode: ChannelMode::Mono,
+        rate_control: RateControl::Cbr(Bitrate::Kbps144),
+    };
+    assert!(
+        Encoder::new(config).is_err(),
+        "144 kbps is LSF-only and must be rejected for an MPEG-1 sample rate"
+    );
+}
+
 #[test]
 fn accepts_discrete_stereo_and_dual_mono() {
     for mode in [ChannelMode::Stereo, ChannelMode::DualMono] {

@@ -26,3 +26,8 @@ simd = []
 
 [dev-dependencies]
 proptest.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "realtime_factor"
+harness = false
