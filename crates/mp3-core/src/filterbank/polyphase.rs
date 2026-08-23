@@ -106,26 +106,51 @@ mod tests {
 
     #[test]
     fn impulse_response_matches_filter_shape() {
-        // A unit impulse at time 0 should produce the prototype filter
-        // shape in the subband outputs (split across all subbands). We
-        // verify that the first analyze() after the impulse produces
-        // non-zero outputs in all subbands (the impulse is spread across
-        // the full 512-sample window).
+        // A unit impulse fed as chunk[31] during call 0 lands at
+        // history[0], then shifts exactly one 32-sample slot per
+        // subsequent analyze() call (Step 1's `history[i] =
+        // history[i-32]`) -- so on call `n` it sits at
+        // `history[32*n]`, for n = 0..=15 (32*15 = 480 <= 511; on call
+        // 16 it would need history[512], out of bounds, so it has fully
+        // exited the window by then). With every other history slot
+        // still zero, Steps 2-4 collapse to a closed form with only one
+        // surviving term:
+        //   idx = 32*n, i0 = idx % 64
+        //   s[k] = filter[idx] * cos((2k+1) * (i0 - 16) * PI / 64)
+        // This checks the actual `ANALYSIS_PROTOTYPE_FILTER` values and
+        // the cosine-matrix formula the implementation uses, not just
+        // "doesn't panic" -- an earlier version of this test only
+        // checked `s.is_finite()`, which would pass even if the
+        // filterbank's math were completely wrong. See
+        // `docs/mp3-encoder/05-phase2-polyphase-filterbank.md` §3 for
+        // the same Step 1-4 breakdown this derivation follows.
+        use crate::filterbank::ANALYSIS_PROTOTYPE_FILTER;
+
         let mut fb = PolyphaseFilterbank::new();
+        let mut impulse_chunk = [0.0f32; 32];
+        impulse_chunk[31] = 1.0; // newest sample = impulse; maps to history[0]
+        let zero_chunk = [0.0f32; 32];
 
-        // First chunk with impulse at position 0 (most recent sample)
-        let mut chunk = [0.0f32; 32];
-        chunk[31] = 1.0; // newest sample = impulse; maps to history[0]
+        for n in 0..16usize {
+            let out = if n == 0 {
+                fb.analyze(&impulse_chunk)
+            } else {
+                fb.analyze(&zero_chunk)
+            };
 
-        let out = fb.analyze(&chunk);
+            let idx = 32 * n;
+            let i0 = idx % 64;
+            let filter_tap = ANALYSIS_PROTOTYPE_FILTER[idx];
 
-        // The impulse at X[0] gets multiplied by C[0] (=0.0), so the
-        // very first output is minimal. After 16+ analyze() calls, the
-        // impulse propagates through the window and produces energy.
-        // For now, just verify the pipeline doesn't crash and produces
-        // finite values.
-        for &s in &out {
-            assert!(s.is_finite(), "subband output should be finite");
+            for (k, &actual) in out.iter().enumerate() {
+                let expected =
+                    filter_tap * libm::cosf(((2 * k + 1) as f32) * (i0 as f32 - 16.0) * PI / 64.0);
+                assert!(
+                    (actual - expected).abs() < 1e-4,
+                    "call {n}, subband {k}: got {actual}, expected {expected} \
+                     (filter[{idx}] = {filter_tap})"
+                );
+            }
         }
     }
 
