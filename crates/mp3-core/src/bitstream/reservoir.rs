@@ -53,7 +53,7 @@ pub struct VbrQuality(pub u8);
 pub struct BitReservoir {
     /// Bits currently "banked" — available to be spent by a future frame
     /// beyond that frame's own nominal allocation. Bounded above by
-    /// [`Self::max_reservoir_bits`].
+    /// `max_reservoir_bits`.
     available_bits: u32,
     /// The cap follows from `main_data_begin`'s width: 511 bytes (4088
     /// bits) for MPEG-1 (9-bit field), 255 bytes (2040 bits) for MPEG-2
@@ -110,7 +110,7 @@ impl BitReservoir {
     ///
     /// If the frame used **fewer** bits than its nominal allocation, the
     /// surplus is banked for future frames (capped at
-    /// [`Self::max_reservoir_bits`]).
+    /// `Self::max_reservoir_bits`).
     ///
     /// If the frame used **more** bits than its nominal allocation, the
     /// deficit is drawn from the bank (cannot go below zero — the

@@ -121,7 +121,7 @@ fn region_cost_with_table(ix: &[i32], start: usize, end: usize, table_id: u8) ->
     Some(bits)
 }
 
-/// Finds the table_id minimizing [`region_cost_with_table`] for this
+/// Finds the table_id minimizing `region_cost_with_table` for this
 /// region, and that minimum cost. Returns `(0, 0)` for an empty or
 /// all-zero region (table 0, no bits).
 fn choose_table_and_cost(ix: &[i32], start: usize, end: usize) -> (u8, u32) {
@@ -253,7 +253,7 @@ fn compute_regions(ix: &[i32; SAMPLES_PER_GRANULE]) -> Regions {
 /// never produces a bitstream that overflows its budget once
 /// [`encode_granule`] runs for real -- this mirrors `encode_granule`'s
 /// actual region splitting and per-region table costing exactly (see
-/// [`region_cost_with_table`]'s doc comment for why a cheaper, per-pair
+/// `region_cost_with_table`'s doc comment for why a cheaper, per-pair
 /// heuristic silently violated that contract). See
 /// `docs/mp3-encoder/09-phase6-huffman-coding.md` §4.
 #[must_use]

@@ -120,6 +120,24 @@ impl Encoder {
                 mode: config.channel_mode,
             });
         }
+        // Bitrate legality is version-dependent (`Bitrate::header_index`
+        // covers both MPEG-1 and MPEG-2 LSF tables, but a `Bitrate` value
+        // legal for one can be `None` for the other -- e.g. 144 kbps is
+        // LSF-only, 320 kbps is MPEG-1-only). This used to go unchecked
+        // here despite this function's own doc comment promising it:
+        // `encode_frame`'s `FrameHeader::to_bits()` was the only place
+        // that actually caught it, deep inside the first encode call. A
+        // caller-facing API (found during the M9 review: `mp3-wasm`'s
+        // `WasmEncoder::push()`) that swallows a rare `encode_frame`
+        // error would then silently produce nothing forever instead of
+        // ever surfacing why -- reject up front, at construction, where
+        // every caller already handles a `Result`.
+        let bitrate = config.rate_control.nominal_bitrate();
+        if bitrate.header_index(version).is_none() {
+            return Err(EncodeError::InvalidBitrate {
+                kbps: bitrate.as_kbps(),
+            });
+        }
 
         let reservoir = BitReservoir::new(BitReservoir::max_for_version(version));
 
