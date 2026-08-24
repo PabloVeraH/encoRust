@@ -63,14 +63,6 @@ MSRV: 1.82 (see `rust-toolchain.toml`).
 encorust input.wav -o output.mp3 -b 192        # CBR (VBR/ABR coming soon)
 ```
 
-## Status
-
-M0–M9 are complete and pass their verification suites. CBR encoding at
-all MPEG-1 sample rates (32/44.1/48 kHz, mono/stereo) produces
-verifiably conformant bitstreams. See `docs/mejoras.md` for the
-improvement plan and `docs/mp3-encoder/14-roadmap-and-milestones.md`
-for milestone-by-milestone detail.
-
 ## License
 
 MIT OR Apache-2.0, at your option.
