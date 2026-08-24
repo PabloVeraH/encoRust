@@ -1,16 +1,15 @@
-> [!WARNING]
-> # 🚧 UNDER DEVELOPMENT — NOT PRODUCTION READY 🚧
+> [!NOTE]
+> # 🚧 Pre-release — CBR encoding functional, more features in progress
 >
-> **This project is in early development and does NOT yet produce valid
-> MP3 files.** The workspace structure, types, frame headers, polyphase
-> filterbank, MDCT with windowing, and anti-aliasing butterfly are
-> implemented and verified, but the psychoacoustic model, quantization,
-> Huffman coding, bit reservoir, and bitstream assembly are still in
-> progress. **If you need to encode audio to MP3 today, use LAME,
-> Shine, or any other established encoder.** Do not open issues asking
-> when it will be ready — public commits speak for themselves.
+> Milestones M0–M9 are complete: polyphase filterbank, MDCT with
+> windowing, anti-aliasing butterfly, Psychoacoustic Model II,
+> quantization loops, Huffman coding, bit reservoir, side-info assembly,
+> CLI/WASM integration. **CBR encoding at all MPEG-1 sample rates
+> (32/44.1/48 kHz) produces verifiably conformant bitstreams.**
 >
-> Curious? Want to contribute? Read the [Status](#status) section.
+> Not yet implemented: VBR/ABR, cross-frame bit reservoir, joint stereo,
+> MPEG-2 LSF, SIMD acceleration, short-block/mixed-block encoding. See
+> [docs/mejoras.md](docs/mejoras.md) for the full improvement plan.
 >
 > ---
 
@@ -27,8 +26,10 @@ binding to a C library (LAME, Shine). encoRust fills that gap with a
 codec written natively in Rust:
 
 - **Real-time friendly**: the encode path is allocation-free after
-  construction, with predictable worst-case latency — suitable for live
-  audio (e.g. encoding a microphone feed).
+  construction (enforced by a counting-allocator regression test — see
+  `crates/mp3-core/tests/m10_zero_alloc.rs`), with predictable
+  worst-case latency — suitable for live audio (e.g. encoding a
+  microphone feed).
 - **WASM as a first-class target**: the core crate is `no_std`-friendly
   and compiles to `wasm32-unknown-unknown`, so the same encoder runs on a
   server or inside a browser `AudioWorklet`.
@@ -38,9 +39,7 @@ codec written natively in Rust:
   MPEG-1 (32/44.1/48 kHz) and MPEG-2 LSF (16/22.05/24 kHz).
 
 MP3 is patent-free worldwide since 2017. This project is written from the
-ISO/IEC 11172-3 / 13818-3 specifications and independent research — it
-contains no code derived from LGPL implementations, keeping the licensing
-clean.
+ISO/IEC 11172-3 / 13818-3 specifications and independent research.
 
 ## Workspace layout
 
@@ -68,24 +67,24 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo build -p mp3-core --target wasm32-unknown-unknown --no-default-features
 ```
 
-MSRV: 1.82.
+CI (`.github/workflows/ci.yml`) runs all of the above plus a
+`--no-default-features` test pass and an MSRV check on every push.
 
-## Usage (target API)
+MSRV: 1.82 (see `rust-toolchain.toml`).
+
+## Usage
 
 ```bash
-encorust input.wav -o output.mp3 -b 192        # CBR
-encorust input.wav -o output.mp3 --vbr-quality 2   # VBR
+encorust input.wav -o output.mp3 -b 192        # CBR (VBR/ABR coming soon)
 ```
 
 ## Status
 
-⚠️ **Early scaffold — not yet functional.** The crate structure, public
-API surface, and test harness are in place and build green, but the DSP
-stages (filterbank, MDCT, psychoacoustic model, quantization, Huffman
-coding, bitstream assembly) are documented stubs. No valid MP3 output is
-produced yet. Progress happens milestone by milestone, each gated on its
-own test suite including validation against independent decoders
-(ffmpeg, Symphonia).
+M0–M9 are complete and pass their verification suites. CBR encoding at
+all MPEG-1 sample rates (32/44.1/48 kHz, mono/stereo) produces
+verifiably conformant bitstreams. See `docs/mejoras.md` for the
+improvement plan and `docs/mp3-encoder/14-roadmap-and-milestones.md`
+for milestone-by-milestone detail.
 
 ## License
 
