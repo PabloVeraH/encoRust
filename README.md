@@ -1,18 +1,3 @@
-> [!NOTE]
-> # 🚧 Pre-release — CBR encoding functional, more features in progress
->
-> Milestones M0–M9 are complete: polyphase filterbank, MDCT with
-> windowing, anti-aliasing butterfly, Psychoacoustic Model II,
-> quantization loops, Huffman coding, bit reservoir, side-info assembly,
-> CLI/WASM integration. **CBR encoding at all MPEG-1 sample rates
-> (32/44.1/48 kHz) produces verifiably conformant bitstreams.**
->
-> Not yet implemented: VBR/ABR, cross-frame bit reservoir, joint stereo,
-> MPEG-2 LSF, SIMD acceleration, short-block/mixed-block encoding. See
-> [docs/mejoras.md](docs/mejoras.md) for the full improvement plan.
->
-> ---
-
 # encoRust
 
 A pure-Rust MPEG-1/2 Layer III (MP3) encoder — no C dependencies, no FFI —
