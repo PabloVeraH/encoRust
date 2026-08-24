@@ -46,11 +46,11 @@ fn bench_encode(c: &mut Criterion, name: &str, channel_mode: ChannelMode) {
 
     c.bench_function(name, |b| {
         b.iter(|| {
-            let config = EncoderConfig {
-                sample_rate: SampleRate::Hz44100,
+            let config = EncoderConfig::new(
+                SampleRate::Hz44100,
                 channel_mode,
-                rate_control: RateControl::Cbr(Bitrate::Kbps128),
-            };
+                RateControl::Cbr(Bitrate::Kbps128),
+            );
             let mut encoder = Encoder::new(config).expect("encoder creation");
             let mut out = Vec::new();
             for frame in &frames {

@@ -5815,7 +5815,16 @@ pub const BIG_VALUES_TABLES: [Option<(usize, u8)>; 32] = [
 ];
 
 /// The 16 VLC encoding tables, indexed by vlc_table_index.
-pub const VLC_TABLES: [HuffmanTable; 16] = [
+///
+/// `static`, not `const`: each entry's `lookup` field references one of
+/// the `static VLC_TABLE_*` arrays above, and a `const` referencing a
+/// `static` (`const_refs_to_static`) only stabilized in Rust 1.83 — this
+/// crate's MSRV is 1.82 (`rust-toolchain.toml`, `Cargo.toml`). `static`
+/// referencing `static` has always been legal, so this keeps the real
+/// MSRV honest instead of only appearing to hold. Runtime behavior is
+/// identical either way — every use site indexes/borrows this table,
+/// none requires it to be usable in a `const` context.
+pub static VLC_TABLES: [HuffmanTable; 16] = [
     HuffmanTable {
         xlen: 0,
         lookup: &[],
@@ -5883,7 +5892,9 @@ pub const VLC_TABLES: [HuffmanTable; 16] = [
 ];
 
 /// The 2 count1 quad tables.
-pub const COUNT1_TABLES: [Count1Table; 2] = [
+///
+/// `static`, not `const` — same MSRV reason as [`VLC_TABLES`] above.
+pub static COUNT1_TABLES: [Count1Table; 2] = [
     Count1Table {
         entries: &QUAD_TABLE_0,
     }, // count1table_select=false (table 32)

@@ -335,6 +335,10 @@ pub fn encode_granule(
         if table_id == 0 {
             continue;
         }
+        // INVARIANT: BIG_VALUES_TABLES is indexed by `table_id`, which is only
+        // set (via `choose_table_and_cost`) when the lookup returned `Some`.
+        // An index returning `None` would indicate a logic bug in table
+        // selection; the caller guarantees it never happens on a valid path.
         let info = BIG_VALUES_TABLES[table_id as usize].unwrap();
         let vlc_idx = info.0;
         let linbits = info.1;

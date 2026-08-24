@@ -5,6 +5,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
+use anyhow::{bail, Context};
 use clap::Parser;
 use mp3_core::bitstream::RateControl;
 use mp3_core::io::PcmBuffer;
@@ -26,13 +27,11 @@ struct Args {
     #[arg(short = 'b', long, conflicts_with_all = ["vbr_quality", "abr"])]
     bitrate: Option<u32>,
 
-    /// Average bitrate in kbps (mutually exclusive with `--bitrate` and
-    /// `--vbr-quality`).
+    /// Average bitrate in kbps (not yet implemented — use `--bitrate`).
     #[arg(long, conflicts_with_all = ["bitrate", "vbr_quality"])]
     abr: Option<u32>,
 
-    /// VBR quality target, 0 (highest) - 9 (smallest) — see
-    /// `docs/mp3-encoder/10-phase7-bit-reservoir-and-rate-control.md` §4.
+    /// VBR quality target, 0 (highest) - 9 (smallest) — not yet implemented.
     #[arg(long, conflicts_with_all = ["bitrate", "abr"])]
     vbr_quality: Option<u8>,
 }
@@ -49,91 +48,73 @@ fn sample_rate_from_hz(hz: u32) -> Option<SampleRate> {
     }
 }
 
-fn main() {
+fn run() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    let mut wav = hound::WavReader::open(&args.input).unwrap_or_else(|e| {
-        eprintln!("failed to open {}: {e}", args.input.display());
-        std::process::exit(1);
-    });
+    let mut wav = hound::WavReader::open(&args.input)
+        .with_context(|| format!("failed to open {}", args.input.display()))?;
     let spec = wav.spec();
 
-    let sample_rate = sample_rate_from_hz(spec.sample_rate).unwrap_or_else(|| {
-        eprintln!(
-            "unsupported sample rate {} Hz — see \
-             docs/mp3-encoder/04-phase1-pcm-io-and-framing.md §2 for the \
-             supported set",
-            spec.sample_rate
+    // --- Validate WAV format ---
+    if spec.bits_per_sample != 16 || spec.sample_format != hound::SampleFormat::Int {
+        bail!(
+            "unsupported WAV format: {}-bit {:?}. Only 16-bit integer WAV is supported.",
+            spec.bits_per_sample,
+            spec.sample_format
         );
-        std::process::exit(1);
-    });
+    }
+
+    let sample_rate = sample_rate_from_hz(spec.sample_rate).with_context(|| {
+        format!(
+            "unsupported sample rate {} Hz — see \
+                 docs/mp3-encoder/04-phase1-pcm-io-and-framing.md §2",
+            spec.sample_rate
+        )
+    })?;
 
     let channel_mode = match spec.channels {
         1 => ChannelMode::Mono,
         2 => ChannelMode::Stereo,
-        n => {
-            eprintln!("unsupported channel count: {n} (expected 1 or 2)");
-            std::process::exit(1);
-        }
+        n => bail!("unsupported channel count: {n} (expected 1 or 2)"),
     };
 
+    // --- Rate control ---
     let rate_control = if let Some(kbps) = args.bitrate {
-        let bitrate = Bitrate::from_kbps(kbps).unwrap_or_else(|| {
-            eprintln!(
-                "unsupported bitrate {kbps} kbps — see \
-                 docs/mp3-encoder/04-phase1-pcm-io-and-framing.md §2 for \
-                 the legal MPEG-1/LSF values"
-            );
-            std::process::exit(1);
-        });
+        let bitrate =
+            Bitrate::from_kbps(kbps).with_context(|| format!("unsupported bitrate {kbps} kbps"))?;
         RateControl::Cbr(bitrate)
-    } else if let Some(kbps) = args.abr {
-        let bitrate = Bitrate::from_kbps(kbps).unwrap_or_else(|| {
-            eprintln!(
-                "unsupported bitrate {kbps} kbps — see \
-                 docs/mp3-encoder/04-phase1-pcm-io-and-framing.md §2 for \
-                 the legal MPEG-1/LSF values"
-            );
-            std::process::exit(1);
-        });
-        RateControl::Abr(bitrate)
-    } else if let Some(q) = args.vbr_quality {
-        RateControl::Vbr(mp3_core::bitstream::reservoir::VbrQuality(q))
+    } else if args.abr.is_some() {
+        bail!(
+            "ABR rate control is not yet implemented. Use --bitrate for CBR \
+             encoding instead. See docs/mejoras.md §2.2."
+        );
+    } else if args.vbr_quality.is_some() {
+        bail!(
+            "VBR rate control is not yet implemented. Use --bitrate for CBR \
+             encoding instead. See docs/mejoras.md §2.2."
+        );
     } else {
-        eprintln!("specify --bitrate, --abr, or --vbr-quality");
-        std::process::exit(1);
+        bail!("specify --bitrate (--abr and --vbr-quality are not yet implemented)");
     };
 
-    let config = EncoderConfig {
-        sample_rate,
-        channel_mode,
-        rate_control,
-    };
-
-    let mut encoder = mp3_core::Encoder::new(config).unwrap_or_else(|e| {
-        eprintln!("failed to create encoder: {e}");
-        std::process::exit(1);
-    });
+    // --- Build encoder ---
+    let config = EncoderConfig::new(sample_rate, channel_mode, rate_control);
+    let mut encoder = mp3_core::Encoder::new(config).context("failed to create encoder")?;
 
     let version = sample_rate.version();
     let samples_per_frame = version.samples_per_frame();
     let n_channels = channel_mode.channel_count();
     let frame_chunk_size = samples_per_frame * n_channels;
 
-    let out_file = File::create(&args.output).unwrap_or_else(|e| {
-        eprintln!("failed to create {}: {e}", args.output.display());
-        std::process::exit(1);
-    });
+    let out_file = File::create(&args.output)
+        .with_context(|| format!("failed to create {}", args.output.display()))?;
     let mut out_writer = BufWriter::new(out_file);
 
     let mut sample_buf: Vec<i16> = Vec::with_capacity(frame_chunk_size);
     let mut total_frames: u64 = 0;
 
     for sample_result in wav.samples::<i16>() {
-        let sample = sample_result.unwrap_or_else(|e| {
-            eprintln!("error reading WAV sample: {e}");
-            std::process::exit(1);
-        });
+        let sample = sample_result.context("error reading WAV sample")?;
         sample_buf.push(sample);
 
         if sample_buf.len() >= frame_chunk_size {
@@ -143,8 +124,7 @@ fn main() {
                 &mut out_writer,
                 channel_mode,
                 version,
-            );
-            // Remove consumed samples, keeping any overflow
+            )?;
             if sample_buf.len() > frame_chunk_size {
                 sample_buf.drain(..frame_chunk_size);
             } else {
@@ -163,33 +143,26 @@ fn main() {
             &mut out_writer,
             channel_mode,
             version,
-        );
+        )?;
         total_frames += 1;
     }
 
     // Flush end-of-stream
     let mut finish_buf = Vec::new();
-    let finish_bytes = encoder.finish(&mut finish_buf).unwrap_or_else(|e| {
-        eprintln!("encoder finish failed: {e}");
-        std::process::exit(1);
-    });
+    let finish_bytes = encoder.finish(&mut finish_buf)?;
     if finish_bytes > 0 {
         out_writer
             .write_all(&finish_buf[..finish_bytes])
-            .unwrap_or_else(|e| {
-                eprintln!("failed to write finish bytes: {e}");
-                std::process::exit(1);
-            });
+            .context("failed to write finish bytes")?;
     }
 
-    out_writer.flush().unwrap_or_else(|e| {
-        eprintln!("failed to flush output: {e}");
-        std::process::exit(1);
-    });
+    out_writer.flush().context("failed to flush output")?;
 
     if total_frames == 0 {
         eprintln!("warning: WAV file had no samples — output is empty");
     }
+
+    Ok(())
 }
 
 fn encode_and_write(
@@ -198,25 +171,25 @@ fn encode_and_write(
     out_writer: &mut BufWriter<File>,
     channel_mode: ChannelMode,
     version: MpegVersion,
-) {
-    let pcm =
-        PcmBuffer::from_i16_interleaved(frame_samples, channel_mode, version).unwrap_or_else(|e| {
-            eprintln!("internal error building PCM buffer: {e}");
-            std::process::exit(1);
-        });
+) -> anyhow::Result<()> {
+    let pcm = PcmBuffer::from_i16_interleaved(frame_samples, channel_mode, version)
+        .context("internal error building PCM buffer")?;
 
     let mut mp3_bytes = Vec::new();
     encoder
         .encode_frame(&pcm, &mut mp3_bytes)
-        .unwrap_or_else(|e| {
-            eprintln!("encoding failed: {e}");
-            std::process::exit(1);
-        });
+        .context("encoding failed")?;
 
-    out_writer.write_all(&mp3_bytes).unwrap_or_else(|e| {
-        eprintln!("failed to write MP3 frame: {e}");
+    out_writer
+        .write_all(&mp3_bytes)
+        .context("failed to write MP3 frame")
+}
+
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("{e}");
         std::process::exit(1);
-    });
+    }
 }
 
 #[cfg(test)]
@@ -235,9 +208,6 @@ mod tests {
 
     #[test]
     fn sample_rate_from_hz_rejects_unsupported_rates() {
-        // 11025/8000 Hz are real WAV sample rates but not legal for
-        // either MPEG-1 or MPEG-2 LSF Layer III (see
-        // docs/mp3-encoder/04-phase1-pcm-io-and-framing.md §2).
         assert_eq!(sample_rate_from_hz(11_025), None);
         assert_eq!(sample_rate_from_hz(8_000), None);
         assert_eq!(sample_rate_from_hz(0), None);

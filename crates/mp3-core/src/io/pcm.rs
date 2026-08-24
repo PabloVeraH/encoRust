@@ -137,9 +137,13 @@ impl PcmBuffer {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // f32::abs() in test assertions -- see docs/mejoras.md §7 item 6
 mod tests {
     use super::*;
+    // Pre-existing no_std-test gap — see the identical note in
+    // bitstream/scalefactor_encode.rs's test module.
     use crate::types::{ChannelMode, MpegVersion};
+    use alloc::vec::Vec;
 
     #[test]
     fn i16_deinterleave_stereo_mpeg1() {

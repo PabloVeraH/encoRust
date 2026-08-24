@@ -12,7 +12,9 @@ edition = "2021"
 rust-version = "1.82"
 license = "MIT OR Apache-2.0"
 authors = ["encoRust contributors"]
-repository = "https://github.com/REPLACE_ME/encoRust"
+repository = "https://github.com/pablete/encoRust"
+keywords = ["mp3", "audio", "encoder", "codec", "wasm"]
+categories = ["multimedia::audio", "command-line-utilities", "wasm"]
 
 # Shared dependency versions across the workspace. Individual crates opt in
 # with `dep_name.workspace = true`. Keep this list small — mp3-core in
@@ -30,11 +32,11 @@ criterion = "0.5"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
+strip = true
+panic = "abort"
 
 [profile.bench]
 inherits = "release"
 
-# wasm binaries care about code size as much as speed; mp3-wasm overrides
-# this further with a dedicated profile once M9 lands (see chapter 12).
 [profile.release.package.mp3-wasm]
 opt-level = "s"

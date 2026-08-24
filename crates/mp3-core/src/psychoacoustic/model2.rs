@@ -1,10 +1,11 @@
 //! Psychoacoustic Model II proper: partitions, spreading function, SMR,
 //! and the block-switching decision. See
 //! `docs/mp3-encoder/07-phase4-psychoacoustic-model.md` §3-5.
-
-extern crate alloc;
-use alloc::vec;
-use alloc::vec::Vec;
+//!
+//! Allocation-free on the hot path: all working buffers are fixed-size
+//! stack arrays. Partition data (which depends only on sample_rate_hz,
+//! a constant for the encoder's lifetime) is pre-computed once and cached
+//! — see `docs/mejoras.md` §3.2, M-1 and M-2.
 
 use crate::mdct::BlockType;
 
@@ -33,13 +34,13 @@ const LN10_OVER_10: f32 = core::f32::consts::LN_10 / 10.0;
 
 /// FFT size for long-block psychoacoustic analysis.
 const FFT_SIZE_LONG: usize = 1024;
-/// FFT size for short-block psychoacoustic analysis.
-#[allow(dead_code)]
-const FFT_SIZE_SHORT: usize = 256;
 /// Number of real FFT output bins (N/2 + 1).
 const FFT_BINS_LONG: usize = FFT_SIZE_LONG / 2 + 1;
-#[allow(dead_code)]
-const FFT_BINS_SHORT: usize = FFT_SIZE_SHORT / 2 + 1;
+
+/// Maximum number of partitions (Bark-grouped FFT bins) across all
+/// supported sample rates — 0.5 Bark/partition over a ~22 kHz bandwidth
+/// yields ~48 partitions for 44.1 kHz; 64 is a safe upper bound.
+const MAX_PARTITIONS: usize = 64;
 
 /// Perceptual entropy transient detection threshold (dB increase over
 /// filtered PE). Tuning parameter — see chapter 07 §5.
@@ -49,8 +50,7 @@ const PE_ATTACK_THRESHOLD_DB: f32 = 10.0;
 const PE_SMOOTH_COEFF: f32 = 0.3;
 
 /// Minimum PE baseline used as the transient-ratio denominator, avoiding
-/// division by (near-)zero after a run of silence while still letting any
-/// non-trivial PE spike produce a very large `pe_ratio`.
+/// division by (near-)zero.
 const PE_BASELINE_FLOOR: f32 = 1e-6;
 
 // ---------------------------------------------------------------------------
@@ -73,13 +73,56 @@ impl Complex {
     }
 }
 
-/// FFT magnitude + phase for one bin, kept across frames for the
-/// unpredictability (tonality) measure.
-#[allow(dead_code)]
-#[derive(Clone, Copy, Default)]
-struct FftBin {
-    magnitude: f32,
-    phase: f32,
+// ---------------------------------------------------------------------------
+// Cached partition data
+// ---------------------------------------------------------------------------
+
+/// Pre-computed partition layout for a given sample rate.  This data
+/// depends only on `sample_rate_hz`, which never changes after
+/// `Encoder::new()` — computing it once instead of on every
+/// `analyze_granule` call eliminates 5 allocations/call plus redundant
+/// `atan()`-based Bark conversion for 513 bins.
+#[derive(Clone)]
+struct PartitionCache {
+    /// `partition_of_bin[i]` = partition index for FFT bin `i`.
+    /// `u8` not `usize`: values never exceed ~64 (the plan's `MAX_PARTITIONS` bound).
+    partition_of_bin: [u8; FFT_BINS_LONG],
+    /// Center frequency (Bark) of each partition.
+    part_centers_bark: [f32; MAX_PARTITIONS],
+    /// Center frequency (Hz) of each partition.
+    part_centers_hz: [f32; MAX_PARTITIONS],
+    /// Number of partitions actually used.
+    num_partitions: usize,
+}
+
+impl PartitionCache {
+    fn new(sample_rate_hz: u32) -> Self {
+        let freq_per_bin = sample_rate_hz as f32 / FFT_SIZE_LONG as f32;
+        let (partition_of_bin_vec, num_parts) =
+            compute_partition_map(FFT_BINS_LONG, freq_per_bin, 0.5);
+
+        let mut maps = [0u8; FFT_BINS_LONG];
+        for (i, &p) in partition_of_bin_vec.iter().enumerate() {
+            maps[i] = p as u8;
+        }
+
+        let bark_centers_vec =
+            partition_bark_centers(&partition_of_bin_vec, num_parts, freq_per_bin);
+        let hz_centers_vec = partition_hz_centers(&partition_of_bin_vec, num_parts, freq_per_bin);
+
+        let mut part_centers_bark = [0.0f32; MAX_PARTITIONS];
+        let mut part_centers_hz = [0.0f32; MAX_PARTITIONS];
+        let n = num_parts.min(MAX_PARTITIONS);
+        part_centers_bark[..n].copy_from_slice(&bark_centers_vec[..n]);
+        part_centers_hz[..n].copy_from_slice(&hz_centers_vec[..n]);
+
+        Self {
+            partition_of_bin: maps,
+            part_centers_bark,
+            part_centers_hz,
+            num_partitions: num_parts,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -106,24 +149,20 @@ pub struct PsychoacousticModel {
     /// (1024-point) analysis. Used by the unpredictability/tonality measure.
     history: [[Complex; FFT_BINS_LONG]; 2],
 
-    /// Smoothed (exponential moving average) perceptual entropy, used as
-    /// the baseline that the current frame's PE is compared against to
-    /// detect a transient. Reflects frames *up to and not including* the
-    /// current one -- see `decide_block_type`.
+    /// Pre-computed partition layout for the configured sample rate.
+    /// `None` until `init_for_sample_rate` is called.
+    partitions: Option<PartitionCache>,
+
+    /// Smoothed perceptual entropy baseline.
     smoothed_pe: f32,
 
-    /// Whether `smoothed_pe` has been seeded by at least one prior frame.
-    /// The very first call has no baseline to compare against, so it
-    /// seeds `smoothed_pe` and reports `Long` unconditionally rather than
-    /// judging a "transient" relative to a baseline that doesn't exist.
+    /// Whether `smoothed_pe` has been seeded.
     pe_initialized: bool,
 
-    /// Current block type state machine output: `Long` in steady state,
-    /// transitions to `Start`/`Short`/`Stop` around transients.
+    /// Current block type state machine output.
     block_type: BlockType,
 
-    /// Short-block persistence counter (number of short-block granules
-    /// remaining before transitioning back to Stop→Long).
+    /// Short-block persistence counter.
     short_count: usize,
 }
 
@@ -135,10 +174,13 @@ impl Default for PsychoacousticModel {
 
 impl PsychoacousticModel {
     /// Creates a fresh model with zeroed FFT history and `Long` block type.
+    /// `init_for_sample_rate` must be called exactly once before the first
+    /// `analyze_granule` call, to pre-compute the partition cache.
     #[must_use]
     pub const fn new() -> Self {
         Self {
             history: [[Complex { re: 0.0, im: 0.0 }; FFT_BINS_LONG]; 2],
+            partitions: None,
             smoothed_pe: 0.0,
             pe_initialized: false,
             block_type: BlockType::Long,
@@ -146,81 +188,94 @@ impl PsychoacousticModel {
         }
     }
 
+    /// Pre-computes and caches all partition data that depends on
+    /// `sample_rate_hz`. Must be called once after construction, before
+    /// the first `analyze_granule` call.  Cheap to call again if a future
+    /// feature changes the sample rate mid-stream (not yet implemented).
+    pub fn init_for_sample_rate(&mut self, sample_rate_hz: u32) {
+        self.partitions = Some(PartitionCache::new(sample_rate_hz));
+    }
+
     /// Analyzes one granule's worth of raw PCM and produces the SMR
     /// values plus block-type decision for that granule.
     ///
-    /// `pcm_window` should contain up to `1024` samples (the long-block
-    /// analysis window, larger than one granule's 576 samples to give the
-    /// masking-threshold FFT some look-ahead — see chapter 07 §2). Fewer
-    /// samples are zero-padded internally; more are truncated.
+    /// `pcm_window` should contain up to `1024` samples; fewer are
+    /// zero-padded internally.
     ///
-    /// `sample_rate_hz` is the PCM sample rate in Hz (44100, 48000, etc.).
+    /// `sample_rate_hz` is the PCM sample rate in Hz.
     pub fn analyze_granule(
         &mut self,
         pcm_window: &[f32],
         sample_rate_hz: u32,
     ) -> (ScalefactorBandSmr, BlockType) {
+        let partitions = self
+            .partitions
+            .as_ref()
+            .expect("init_for_sample_rate must be called before analyze_granule");
+
         let sfb_idx = scalefactor_sample_rate_index(sample_rate_hz);
         let sfb_count = SFB_LONG_COUNTS[sfb_idx];
         let sfb_bounds = &SFB_LONG_BOUNDARIES[sfb_idx];
 
-        // Step 1: FFT analysis (1024-pt for long-block estimation)
-        let (mag, re, im) = self.fft_analyze_long(pcm_window, sample_rate_hz);
+        // --- All working buffers, stack-allocated ---
+        let mut mag = [0.0f32; FFT_BINS_LONG];
+        let mut re = [0.0f32; FFT_BINS_LONG];
+        let mut im = [0.0f32; FFT_BINS_LONG];
+
+        // Step 1: FFT analysis
+        self.fft_analyze_long(pcm_window, &mut mag, &mut re, &mut im);
 
         // Step 2: Tonality per FFT bin from history
-        let tonality_bin = self.compute_tonality(&re, &im);
+        let mut tonality_bin = [0.0f32; FFT_BINS_LONG];
+        self.compute_tonality(&re, &im, &mut tonality_bin);
 
-        // Step 3: Partition grouping
-        let freq_per_bin = sample_rate_hz as f32 / FFT_SIZE_LONG as f32;
-        let (partition_map, num_partitions) =
-            compute_partition_map(FFT_BINS_LONG, freq_per_bin, 0.5);
-        let part_centers_bark =
-            partition_bark_centers(&partition_map, num_partitions, freq_per_bin);
-        let part_centers_hz = partition_hz_centers(&partition_map, num_partitions, freq_per_bin);
-
-        // Step 4: Per-partition energy and tonality
-        let mut part_energy = vec![0.0f32; num_partitions];
-        let mut part_tonality = vec![0.0f32; num_partitions];
-        let mut part_tonality_count = vec![0usize; num_partitions];
+        // Step 3-4: Per-partition energy and tonality
+        let mut part_energy = [0.0f32; MAX_PARTITIONS];
+        let mut part_tonality_sum = [0.0f32; MAX_PARTITIONS];
+        let mut part_tonality_count = [0usize; MAX_PARTITIONS];
 
         for i in 0..FFT_BINS_LONG {
-            let p = partition_map[i];
-            part_energy[p] += mag[i] * mag[i];
-            part_tonality[p] += tonality_bin[i];
-            part_tonality_count[p] += 1;
-        }
-
-        for p in 0..num_partitions {
-            if part_tonality_count[p] > 0 {
-                part_tonality[p] /= part_tonality_count[p] as f32;
+            let p = partitions.partition_of_bin[i] as usize;
+            if p < MAX_PARTITIONS {
+                part_energy[p] += mag[i] * mag[i];
+                part_tonality_sum[p] += tonality_bin[i];
+                part_tonality_count[p] += 1;
             }
         }
 
-        // Step 5: Spreading function convolution
-        let mut part_threshold = vec![0.0f32; num_partitions];
-        for i in 0..num_partitions {
-            for j in 0..num_partitions {
-                let dz = part_centers_bark[j] - part_centers_bark[i];
+        let num_parts = partitions.num_partitions.min(MAX_PARTITIONS);
+        let mut part_tonality = [0.0f32; MAX_PARTITIONS];
+        for p in 0..num_parts {
+            if part_tonality_count[p] > 0 {
+                part_tonality[p] = part_tonality_sum[p] / part_tonality_count[p] as f32;
+            }
+        }
+
+        // Step 5: Spreading function convolution. Both `i` and `j` index
+        // the same `part_centers_bark`/`part_energy` arrays at once
+        // (part_threshold[i] accumulates a contribution from every j) —
+        // not expressible as a single enumerate() without indexing back
+        // into the source arrays anyway, so the range form is clearer.
+        let mut part_threshold = [0.0f32; MAX_PARTITIONS];
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..num_parts {
+            for j in 0..num_parts {
+                let dz = partitions.part_centers_bark[j] - partitions.part_centers_bark[i];
                 let spread_db = spreading_db(dz);
                 let spread_linear = exp(spread_db * LN10_OVER_10);
                 part_threshold[i] += part_energy[j] * spread_linear;
             }
         }
 
-        // Step 6: Apply tonality-based required SNR and compute per-partition
-        // SMR. Tonal content (tonality → 1): needs higher SNR (TMN ≈ 29 dB);
-        // noisy content (tonality → 0): needs lower SNR (NMT ≈ 6 dB).
-        let mut part_smr = vec![1.0f32; num_partitions];
-        for p in 0..num_partitions {
+        // Step 6: Apply tonality-based SNR and compute per-partition SMR
+        let mut part_smr = [1.0f32; MAX_PARTITIONS];
+        for p in 0..num_parts {
             let t = part_tonality[p].clamp(0.0, 1.0);
             let snr_db = t * TMN_DB + (1.0 - t) * NMT_DB;
             let snr_linear = exp(snr_db * LN10_OVER_10);
             part_threshold[p] /= snr_linear;
 
-            // Apply absolute threshold of hearing floor, looked up at the
-            // partition's actual center frequency (no lossy round-trip
-            // through an approximate Bark-to-Hz inversion).
-            let ath_linear = ath_from_db(absolute_threshold_db(part_centers_hz[p]));
+            let ath_linear = ath_from_db(absolute_threshold_db(partitions.part_centers_hz[p]));
             if part_threshold[p] < ath_linear {
                 part_threshold[p] = ath_linear;
             }
@@ -230,21 +285,8 @@ impl PsychoacousticModel {
             }
         }
 
-        // Step 7: Map per-partition SMR to scalefactor bands.
-        //
-        // Each SFB's SMR is the *maximum* SMR among its constituent
-        // partitions, not `sum(energy)/sum(threshold)` or
-        // `sum(energy)/min(threshold)` -- both of those combine an
-        // extensive quantity (energy, which grows with how many
-        // partitions/bins are summed) with one that doesn't scale the
-        // same way, which systematically biases wide (typically
-        // high-frequency) bands regardless of actual masking. Per-
-        // partition SMR has no such bias (numerator and denominator come
-        // from the same partition), and taking the max reflects the
-        // standard's actual intent: the allowed distortion for a band is
-        // set by whichever frequency within it is *least* masked, since a
-        // quantizer that only satisfies the band's average would still
-        // leave that point audibly distorted.
+        // Step 7: Map per-partition SMR to scalefactor bands
+        let freq_per_bin = sample_rate_hz as f32 / FFT_SIZE_LONG as f32;
         let mut sfb_smr = [1.0f32; 22];
         for sfb in 0..sfb_count {
             let start_line = sfb_bounds[sfb];
@@ -256,8 +298,9 @@ impl PsychoacousticModel {
             let end_bin = (ceil(end_freq / freq_per_bin) as usize).min(FFT_BINS_LONG - 1);
 
             if end_bin > start_bin {
-                let mut visited = [false; 64]; // num_partitions ~48 for 44.1 kHz
-                for &p in &partition_map[start_bin..end_bin] {
+                let mut visited = [false; MAX_PARTITIONS];
+                for &p in &partitions.partition_of_bin[start_bin..end_bin] {
+                    let p = p as usize;
                     if p < visited.len() && !visited[p] {
                         visited[p] = true;
                         if part_smr[p] > sfb_smr[sfb] {
@@ -268,8 +311,12 @@ impl PsychoacousticModel {
             }
         }
 
-        // Step 9: Block-type decision via perceptual entropy
-        let pe = self.compute_perceptual_entropy(&mag, &partition_map, num_partitions);
+        // Step 8: Perceptual entropy + block-type decision
+        let pe = self.compute_perceptual_entropy(
+            &mag,
+            &partitions.partition_of_bin,
+            partitions.num_partitions,
+        );
         self.decide_block_type(pe);
 
         // Save history for next frame
@@ -288,51 +335,48 @@ impl PsychoacousticModel {
     // Internal methods
     // -----------------------------------------------------------------------
 
-    /// Run 1024-point FFT analysis on the PCM window, returning
-    /// magnitude, real, and imaginary parts.
+    /// Run 1024-point FFT analysis, writing magnitude, real, and imaginary
+    /// parts into caller-provided stack buffers.
     fn fft_analyze_long(
         &self,
         pcm_window: &[f32],
-        _sample_rate_hz: u32,
-    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        mag: &mut [f32; FFT_BINS_LONG],
+        re: &mut [f32; FFT_BINS_LONG],
+        im: &mut [f32; FFT_BINS_LONG],
+    ) {
         let mut workspace = [0.0f32; FFT_SIZE_LONG];
         let copy_len = pcm_window.len().min(FFT_SIZE_LONG);
         workspace[..copy_len].copy_from_slice(&pcm_window[..copy_len]);
 
-        let mut re = vec![0.0f32; FFT_BINS_LONG];
-        let mut im = vec![0.0f32; FFT_BINS_LONG];
-        fft_windowed_complex(&workspace, &mut re, &mut im);
+        fft_windowed_complex(&workspace, re, im);
 
-        let mut mag = vec![0.0f32; FFT_BINS_LONG];
         for i in 0..FFT_BINS_LONG {
             mag[i] = sqrt(re[i] * re[i] + im[i] * im[i]);
         }
-
-        (mag, re, im)
     }
 
-    /// Compute tonality per FFT bin using the 2-frame history
-    /// (unpredictability measure from Annex D §4.3).
-    fn compute_tonality(&self, re: &[f32], im: &[f32]) -> Vec<f32> {
-        let mut tonality = vec![0.0f32; FFT_BINS_LONG];
-
+    /// Compute tonality per FFT bin from the 2-frame history, writing
+    /// into a caller-provided stack buffer.
+    fn compute_tonality(
+        &self,
+        re: &[f32; FFT_BINS_LONG],
+        im: &[f32; FFT_BINS_LONG],
+        tonality: &mut [f32; FFT_BINS_LONG],
+    ) {
         for i in 0..FFT_BINS_LONG {
             let mag = sqrt(re[i] * re[i] + im[i] * im[i]);
 
-            // Predict magnitude from previous 2 frames (linear extrapolation)
             let prev0_mag = self.history[0][i].magnitude();
             let prev1_mag = self.history[1][i].magnitude();
             let pred_mag = 2.0 * prev0_mag - prev1_mag;
             let pred_mag = pred_mag.max(0.0);
 
-            // Predict phase from previous 2 frames
             let prev0_phase = self.history[0][i].phase();
             let prev1_phase = self.history[1][i].phase();
             let pred_phase = 2.0 * prev0_phase - prev1_phase;
 
             let phase = atan2(im[i], re[i]);
 
-            // Normalized unpredictability: how much the actual differs from prediction
             let denom = pred_mag + mag + 1e-30;
             let mag_term = (pred_mag - mag) / denom;
             let cw = sqrt(
@@ -340,36 +384,34 @@ impl PsychoacousticModel {
                     + (2.0 * pred_mag * mag * (1.0 - cos(phase - pred_phase)) / (denom * denom)),
             );
 
-            // Tonality = 1 - unpredictability, clamped to [0, 1]
             tonality[i] = (1.0_f32 - cw).clamp(0.0, 1.0);
         }
-
-        tonality
     }
 
     /// Compute perceptual entropy from the FFT magnitude spectrum.
-    /// PE = -sum over partitions of bandwidth * log10(energy/(thr*bw) + 1)
     fn compute_perceptual_entropy(
-        &mut self,
-        mag: &[f32],
-        partition_map: &[usize],
+        &self,
+        mag: &[f32; FFT_BINS_LONG],
+        partition_of_bin: &[u8; FFT_BINS_LONG],
         num_partitions: usize,
     ) -> f32 {
-        let mut part_energy = vec![0.0f32; num_partitions];
-        let mut part_count = vec![0usize; num_partitions];
+        let mut part_energy = [0.0f32; MAX_PARTITIONS];
+        let mut part_count = [0usize; MAX_PARTITIONS];
 
-        for i in 0..mag.len() {
-            let p = partition_map[i];
-            part_energy[p] += mag[i] * mag[i];
-            part_count[p] += 1;
+        for i in 0..FFT_BINS_LONG {
+            let p = partition_of_bin[i] as usize;
+            if p < MAX_PARTITIONS {
+                part_energy[p] += mag[i] * mag[i];
+                part_count[p] += 1;
+            }
         }
 
+        let num_p = num_partitions.min(MAX_PARTITIONS);
         let mut pe = 0.0f32;
-        for p in 0..num_partitions {
+        for p in 0..num_p {
             if part_count[p] > 0 && part_energy[p] > 0.0 {
                 let bw = part_count[p] as f32;
                 let energy_per_bin = part_energy[p] / bw;
-                // Simple threshold estimate: just use a small floor
                 let thr = energy_per_bin * 1e-6 + 1e-30;
                 pe += bw * log10(energy_per_bin / thr + 1.0);
             }
@@ -379,20 +421,8 @@ impl PsychoacousticModel {
     }
 
     /// Block-type state machine based on perceptual entropy transients.
-    ///
-    /// The ratio compares the current frame's PE against the smoothed
-    /// baseline accumulated *before* this frame — comparing it against a
-    /// baseline already blended with the current frame's own energy would
-    /// cap `pe_ratio` at `1 / PE_SMOOTH_COEFF` regardless of how large the
-    /// transient actually is (and pins it at exactly 1.0 the first time a
-    /// transient follows silence, since the cold-start baseline collapses
-    /// to the current value), making the threshold unreachable. See the
-    /// M4 review notes for the derivation.
     fn decide_block_type(&mut self, pe: f32) {
         if !self.pe_initialized {
-            // First frame ever: there is no baseline yet to judge a
-            // transient against. Seed it and report `Long` (the default)
-            // rather than comparing `pe` to a baseline that doesn't exist.
             self.smoothed_pe = pe;
             self.pe_initialized = true;
             return;
@@ -401,25 +431,16 @@ impl PsychoacousticModel {
         let baseline = self.smoothed_pe.max(PE_BASELINE_FLOOR);
         let pe_ratio = pe / baseline;
 
-        // Update the smoothed baseline for the *next* call only after
-        // computing this frame's ratio against the pre-update value.
         self.smoothed_pe = PE_SMOOTH_COEFF * pe + (1.0 - PE_SMOOTH_COEFF) * self.smoothed_pe;
 
         match self.block_type {
             BlockType::Long => {
                 if pe_ratio > PE_ATTACK_THRESHOLD_DB {
                     self.block_type = BlockType::Start;
-                    self.short_count = 3; // 3 short granules after Start
+                    self.short_count = 3;
                 }
             }
             BlockType::Start => {
-                // `short_count` (3) was set on the Long->Start transition
-                // above and belongs to the 3 granules about to be
-                // reported as `Short` below -- this transition doesn't
-                // itself report a `Short` granule, so it must not
-                // consume one of the 3, or only 2 `Short` granules are
-                // ever produced instead of the Long -> Start -> Short×3
-                // -> Stop -> Long sequence chapter 07 §5 specifies.
                 self.block_type = BlockType::Short;
             }
             BlockType::Short => {
@@ -439,8 +460,6 @@ impl PsychoacousticModel {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Convert ATH dB SPL to linear power (arbitrary units, consistent with
-/// the internal energy scale).
 fn ath_from_db(db: f32) -> f32 {
     if db < -100.0 {
         return 1e-20;
@@ -453,12 +472,14 @@ fn ath_from_db(db: f32) -> f32 {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // f32::abs() in test assertions -- see docs/mejoras.md §7 item 6
 mod tests {
     use super::*;
+    use alloc::vec;
+    use alloc::vec::Vec;
     use core::f32::consts::PI;
     use libm::sinf as sin;
 
-    /// Generate a test tone at a specific frequency, sample rate, and duration.
     fn make_tone(freq: f32, sample_rate: u32, num_samples: usize) -> Vec<f32> {
         let mut samples = Vec::with_capacity(num_samples);
         for i in 0..num_samples {
@@ -468,10 +489,8 @@ mod tests {
         samples
     }
 
-    /// Generate white noise samples.
     fn make_noise(num_samples: usize) -> Vec<f32> {
         let mut samples = Vec::with_capacity(num_samples);
-        // Simple pseudo-random using a linear congruential generator
         let mut seed: u32 = 12345;
         for _ in 0..num_samples {
             seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
@@ -480,27 +499,27 @@ mod tests {
         samples
     }
 
-    // --- SMR shape tests ---
-
-    /// SMR standard deviation across the 22 long-block bands (44.1 kHz),
-    /// a measure of how "peaky" vs. "flat" the SMR profile is.
     fn smr_std_dev(bands: &[f32; 22]) -> f32 {
         let mean: f32 = bands.iter().sum::<f32>() / 22.0;
         let variance: f32 = bands.iter().map(|&s| (s - mean) * (s - mean)).sum::<f32>() / 22.0;
         sqrt(variance)
     }
 
+    fn make_model(sample_rate_hz: u32) -> PsychoacousticModel {
+        let mut model = PsychoacousticModel::new();
+        model.init_for_sample_rate(sample_rate_hz);
+        model
+    }
+
     #[test]
     fn smr_tone_produces_high_smr_at_own_frequency() {
-        let mut model = PsychoacousticModel::new();
+        let mut model = make_model(44100);
         let tone = make_tone(1000.0, 44100, 1024);
         let (smr, _bt) = model.analyze_granule(&tone, 44100);
 
-        // A pure 1 kHz tone should produce high SMR somewhere in the mid bands.
         let has_high_smr = smr.bands.iter().any(|&s| s > 2.0);
         assert!(has_high_smr, "tone should produce SMR > 1.0 in some bands");
 
-        // All SMR values should be >= 1.0
         for (i, &s) in smr.bands.iter().enumerate().take(22) {
             assert!(s >= 1.0, "SMR band {i} is {s}, should be >= 1.0");
         }
@@ -508,10 +527,7 @@ mod tests {
 
     #[test]
     fn smr_tone_shows_spreading_shape_around_peak() {
-        // DoD (chapter 07 §6): "a pure tone produces a high SMR at its own
-        // frequency and progressively lower SMR moving away from it
-        // (spreading function visible in the output)".
-        let mut model = PsychoacousticModel::new();
+        let mut model = make_model(44100);
         let tone = make_tone(1000.0, 44100, 1024);
         let (smr, _bt) = model.analyze_granule(&tone, 44100);
         let bands = &smr.bands[..22];
@@ -527,9 +543,6 @@ mod tests {
             "tone should produce a clear SMR peak, got {peak_val}"
         );
 
-        // Bands well away (>=6 SFB) from the tone's own band should sit
-        // markedly below the peak -- if the spreading function had no
-        // effect, SMR would be flat across all bands instead.
         let far_max = bands
             .iter()
             .enumerate()
@@ -545,14 +558,11 @@ mod tests {
 
     #[test]
     fn smr_noise_is_flatter_than_tone() {
-        // DoD (chapter 07 §6): tone SMR is peaky (spreading-shaped), white
-        // noise SMR is "comparatively flat" -- test the comparison
-        // directly rather than an arbitrary absolute bound on noise alone.
-        let mut tone_model = PsychoacousticModel::new();
+        let mut tone_model = make_model(44100);
         let tone = make_tone(1000.0, 44100, 1024);
         let (tone_smr, _) = tone_model.analyze_granule(&tone, 44100);
 
-        let mut noise_model = PsychoacousticModel::new();
+        let mut noise_model = make_model(44100);
         let noise = make_noise(1024);
         let (noise_smr, _) = noise_model.analyze_granule(&noise, 44100);
 
@@ -566,8 +576,6 @@ mod tests {
         );
     }
 
-    // --- Block-type decision tests ---
-
     #[test]
     fn block_type_defaults_to_long() {
         let model = PsychoacousticModel::new();
@@ -576,9 +584,7 @@ mod tests {
 
     #[test]
     fn silent_signal_stays_long() {
-        let mut model = PsychoacousticModel::new();
-
-        // Feed several frames of silence
+        let mut model = make_model(44100);
         let silence = vec![0.0f32; 1024];
         for _ in 0..10 {
             let (_smr, bt) = model.analyze_granule(&silence, 44100);
@@ -592,12 +598,7 @@ mod tests {
 
     #[test]
     fn transient_drives_start_short_short_short_stop_sequence() {
-        // DoD (chapter 07 §6): a synthetic transient (full-scale noise
-        // burst after silence) must be flagged, driving the model through
-        // exactly the Long -> Start -> Short×3 -> Stop -> Long sequence
-        // chapter 07 §5 specifies.
-        let mut model = PsychoacousticModel::new();
-
+        let mut model = make_model(44100);
         let silence = vec![0.0f32; 1024];
         for _ in 0..5 {
             model.analyze_granule(&silence, 44100);
@@ -627,12 +628,8 @@ mod tests {
 
     #[test]
     fn stationary_tone_stays_long_after_initial_settle() {
-        let mut model = PsychoacousticModel::new();
+        let mut model = make_model(44100);
         let tone = make_tone(440.0, 44100, 1024);
-
-        // The very first call seeds the PE baseline (no prior frame to
-        // compare against); every call after that must not spuriously
-        // trigger short blocks for a genuinely stationary signal.
         model.analyze_granule(&tone, 44100);
 
         for _ in 0..10 {
@@ -645,11 +642,9 @@ mod tests {
         }
     }
 
-    // --- Edge cases ---
-
     #[test]
     fn silence_produces_finite_smr() {
-        let mut model = PsychoacousticModel::new();
+        let mut model = make_model(44100);
         let silence = vec![0.0f32; 1024];
         let (smr, _bt) = model.analyze_granule(&silence, 44100);
 
@@ -661,7 +656,7 @@ mod tests {
 
     #[test]
     fn fullscale_produces_finite_smr() {
-        let mut model = PsychoacousticModel::new();
+        let mut model = make_model(44100);
         let mut fullscale = vec![0.0f32; 1024];
         for (i, item) in fullscale.iter_mut().enumerate() {
             *item = sin(i as f32 * 0.1) * 0.999;
@@ -678,10 +673,9 @@ mod tests {
 
     #[test]
     fn smr_multiple_frames_consistent() {
-        let mut model = PsychoacousticModel::new();
+        let mut model = make_model(44100);
         let tone = make_tone(500.0, 44100, 1024);
 
-        // Run two frames and check both produce valid results
         let (smr1, _) = model.analyze_granule(&tone, 44100);
         let (smr2, _) = model.analyze_granule(&tone, 44100);
 
@@ -692,8 +686,20 @@ mod tests {
             assert!(smr2.bands[i] >= 1.0);
         }
 
-        // SMR should be non-zero for tone
         let mean1: f32 = smr1.bands.iter().take(22).sum::<f32>() / 22.0;
         assert!(mean1 > 0.0, "SMR should be positive for tone signal");
+    }
+
+    #[test]
+    fn partition_cache_produces_same_result_as_original() {
+        let mut model = make_model(44100);
+        let tone = make_tone(440.0, 44100, 1024);
+        let (smr1, _) = model.analyze_granule(&tone, 44100);
+        let (smr2, _) = model.analyze_granule(&tone, 44100);
+
+        for i in 0..22 {
+            assert!(smr1.bands[i].is_finite());
+            assert!(smr2.bands[i].is_finite());
+        }
     }
 }

@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Pure-Rust MPEG-1/2 Layer III (MP3) encoder core — no I/O, no_std-friendly."
+readme = "../../README.md"
+
+[package.metadata.docs.rs]
+default-target = "x86_64-unknown-linux-gnu"
+targets = ["wasm32-unknown-unknown"]
 
 [dependencies]
 thiserror = { workspace = true, default-features = false }
@@ -20,9 +25,6 @@ libm = { version = "0.2", default-features = false }
 [features]
 default = ["std"]
 std = ["thiserror/std"]
-# Reserved for milestone M9 (SIMD hot-loop optimization). See
-# docs/mp3-encoder/12-phase9-cli-and-wasm.md §3. No effect yet.
-simd = []
 
 [dev-dependencies]
 proptest.workspace = true

@@ -6,8 +6,6 @@
 //! any correct radix-2 FFT implementation is acceptable, no table
 //! provenance concern applies here.
 
-#![allow(clippy::needless_range_loop)]
-
 use core::f32::consts::PI;
 // `no_std`-safe: call these as free functions, never as `x.sqrt()` method
 // syntax, which resolves to the (missing under `core`) inherent method.
@@ -141,6 +139,8 @@ fn fft_radix2(n: usize, re: &mut [f32], im: &mut [f32]) {
 }
 
 #[cfg(test)]
+// Scoped to `tests` only — see docs/mejoras.md §7 item 6.
+#[allow(clippy::needless_range_loop, clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

@@ -87,9 +87,11 @@ impl PolyphaseFilterbank {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // f32::abs() in test assertions -- see docs/mejoras.md §7 item 6
 mod tests {
     use super::*;
     use core::f32::consts::PI;
+    use libm::sinf as sin;
 
     #[test]
     fn zero_input_produces_zero_output() {
@@ -208,7 +210,7 @@ mod tests {
             let mut chunk = [0.0f32; 32];
             for (j, item) in chunk.iter_mut().enumerate() {
                 let t = step * 32 + j;
-                *item = f32::sin(omega * t as f32);
+                *item = sin(omega * t as f32);
             }
             fb.analyze(&chunk);
         }
@@ -216,7 +218,7 @@ mod tests {
         // Now analyze one more chunk
         let mut final_chunk = [0.0f32; 32];
         for (j, item) in final_chunk.iter_mut().enumerate() {
-            *item = f32::sin(omega * (16 * 32 + j) as f32);
+            *item = sin(omega * (16 * 32 + j) as f32);
         }
         let out = fb.analyze(&final_chunk);
 
