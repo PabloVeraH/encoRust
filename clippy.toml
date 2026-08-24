@@ -1,0 +1,23 @@
+# std-only f32::sin/cos/sqrt/round silently fail under no_std (the
+# polyphase filterbank, psychoacoustic FFT, and MDCT windows all use
+# libm). Four separate regressions (M2/M3, M4, M7, M8) have hit this —
+# let clippy catch it at lint time instead of waiting for the WASM
+# build to fail. Prefer libm::sinf/cosf/sqrtf/roundf everywhere.
+#
+# `disallowed-methods` must be a top-level array (of strings or
+# {path, reason} tables), not a `[disallowed-methods]` table header —
+# the table-header form parses as a map and clippy rejects it outright
+# ("invalid type: map, expected a sequence"), silently disabling every
+# other lint in the same invocation, not just this one.
+disallowed-methods = [
+    { path = "f32::sin", reason = "std-only; use `libm::sinf` instead" },
+    { path = "f32::cos", reason = "std-only; use `libm::cosf` instead" },
+    { path = "f32::sqrt", reason = "std-only; use `libm::sqrtf` instead" },
+    { path = "f32::round", reason = "std-only; use `libm::roundf` instead" },
+    # Found live in production code (quantize/loop_control.rs) during the
+    # docs/mejoras.md review — this crate's MSRV (1.82) predates `abs()`
+    # moving into `core::f32`, so it's std-only here same as the above,
+    # despite not needing libm's actual math (it's a bitmask op) — the
+    # fix is still `libm::fabsf`, which provides it under `no_std` too.
+    { path = "f32::abs", reason = "std-only under this crate's MSRV; use `libm::fabsf` instead" },
+]

@@ -46,6 +46,7 @@ pub const MAX_CHANNELS: usize = 2;
 /// applies. `Mpeg1` is ISO/IEC 11172-3; `Mpeg2Lsf` ("Low Sampling
 /// Frequency") is ISO/IEC 13818-3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MpegVersion {
     /// ISO/IEC 11172-3 — 32/44.1/48 kHz.
     Mpeg1,
@@ -88,6 +89,7 @@ impl MpegVersion {
 /// standardized) is intentionally not included — see
 /// `docs/mp3-encoder/00-overview.md` §1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SampleRate {
     /// 44.1 kHz (MPEG-1).
     Hz44100,
@@ -292,6 +294,7 @@ impl Bitrate {
 /// for joint stereo, a 2-bit `mode_extension`. See
 /// `docs/mp3-encoder/04-phase1-pcm-io-and-framing.md` §3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ChannelMode {
     /// Single channel.
     Mono,

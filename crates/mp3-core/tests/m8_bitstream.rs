@@ -12,11 +12,11 @@ use mp3_core::{
 /// MPEG-1 frame (syncword, correct header fields, side-info size).
 #[test]
 fn encode_single_frame_produces_valid_header() {
-    let config = EncoderConfig {
-        sample_rate: SampleRate::Hz44100,
-        channel_mode: ChannelMode::Mono,
-        rate_control: RateControl::Cbr(Bitrate::Kbps128),
-    };
+    let config = EncoderConfig::new(
+        SampleRate::Hz44100,
+        ChannelMode::Mono,
+        RateControl::Cbr(Bitrate::Kbps128),
+    );
     let mut encoder = Encoder::new(config).expect("encoder creation");
 
     // 1152 mono samples for MPEG-1
@@ -74,11 +74,11 @@ fn encode_single_frame_produces_valid_header() {
 /// Encode a single stereo frame and verify the header.
 #[test]
 fn encode_stereo_frame_produces_valid_header() {
-    let config = EncoderConfig {
-        sample_rate: SampleRate::Hz44100,
-        channel_mode: ChannelMode::Stereo,
-        rate_control: RateControl::Cbr(Bitrate::Kbps192),
-    };
+    let config = EncoderConfig::new(
+        SampleRate::Hz44100,
+        ChannelMode::Stereo,
+        RateControl::Cbr(Bitrate::Kbps192),
+    );
     let mut encoder = Encoder::new(config).expect("encoder creation");
 
     // 1152 stereo samples (2304 interleaved)
@@ -106,11 +106,11 @@ fn encode_stereo_frame_produces_valid_header() {
 /// Encode multiple frames and verify the padding accumulator works correctly.
 #[test]
 fn multiple_frames_have_correct_sizes() {
-    let config = EncoderConfig {
-        sample_rate: SampleRate::Hz44100,
-        channel_mode: ChannelMode::Mono,
-        rate_control: RateControl::Cbr(Bitrate::Kbps128),
-    };
+    let config = EncoderConfig::new(
+        SampleRate::Hz44100,
+        ChannelMode::Mono,
+        RateControl::Cbr(Bitrate::Kbps128),
+    );
     let mut encoder = Encoder::new(config).expect("encoder creation");
 
     let samples: Vec<i16> = vec![0; 1152];
@@ -149,11 +149,7 @@ fn rejects_lsf_sample_rates() {
         SampleRate::Hz24000,
         SampleRate::Hz16000,
     ] {
-        let config = EncoderConfig {
-            sample_rate: sr,
-            channel_mode: ChannelMode::Mono,
-            rate_control: RateControl::Cbr(Bitrate::Kbps128),
-        };
+        let config = EncoderConfig::new(sr, ChannelMode::Mono, RateControl::Cbr(Bitrate::Kbps128));
         assert!(
             Encoder::new(config).is_err(),
             "{sr:?} (LSF) should be rejected, not silently mis-encoded"
@@ -167,11 +163,11 @@ fn rejects_joint_stereo_modes() {
         ChannelMode::JointStereoMs,
         ChannelMode::JointStereoIntensity,
     ] {
-        let config = EncoderConfig {
-            sample_rate: SampleRate::Hz44100,
-            channel_mode: mode,
-            rate_control: RateControl::Cbr(Bitrate::Kbps128),
-        };
+        let config = EncoderConfig::new(
+            SampleRate::Hz44100,
+            mode,
+            RateControl::Cbr(Bitrate::Kbps128),
+        );
         assert!(
             Encoder::new(config).is_err(),
             "{mode:?} should be rejected until the MS/intensity transform exists"
@@ -192,11 +188,11 @@ fn rejects_joint_stereo_modes() {
 #[test]
 fn rejects_bitrate_invalid_for_version() {
     // 144 kbps only has a header_index for MPEG-2 LSF, not MPEG-1.
-    let config = EncoderConfig {
-        sample_rate: SampleRate::Hz44100, // MPEG-1
-        channel_mode: ChannelMode::Mono,
-        rate_control: RateControl::Cbr(Bitrate::Kbps144),
-    };
+    let config = EncoderConfig::new(
+        SampleRate::Hz44100, // MPEG-1
+        ChannelMode::Mono,
+        RateControl::Cbr(Bitrate::Kbps144),
+    );
     assert!(
         Encoder::new(config).is_err(),
         "144 kbps is LSF-only and must be rejected for an MPEG-1 sample rate"
@@ -206,11 +202,11 @@ fn rejects_bitrate_invalid_for_version() {
 #[test]
 fn accepts_discrete_stereo_and_dual_mono() {
     for mode in [ChannelMode::Stereo, ChannelMode::DualMono] {
-        let config = EncoderConfig {
-            sample_rate: SampleRate::Hz44100,
-            channel_mode: mode,
-            rate_control: RateControl::Cbr(Bitrate::Kbps128),
-        };
+        let config = EncoderConfig::new(
+            SampleRate::Hz44100,
+            mode,
+            RateControl::Cbr(Bitrate::Kbps128),
+        );
         assert!(
             Encoder::new(config).is_ok(),
             "{mode:?} doesn't need a cross-channel transform, should be accepted"
@@ -296,11 +292,11 @@ fn main_data_begin_never_references_untransmitted_bytes() {
     // check (with this same quiet-then-loud content, chosen because
     // constant-complexity content never draws a reservoir down at all --
     // see the git history / M8 review notes for the failing run).
-    let config = EncoderConfig {
-        sample_rate: SampleRate::Hz44100,
-        channel_mode: ChannelMode::Mono,
-        rate_control: RateControl::Cbr(Bitrate::Kbps64),
-    };
+    let config = EncoderConfig::new(
+        SampleRate::Hz44100,
+        ChannelMode::Mono,
+        RateControl::Cbr(Bitrate::Kbps64),
+    );
     let mut encoder = Encoder::new(config).expect("encoder creation");
 
     let mut seed: u32 = 42;

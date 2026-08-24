@@ -80,12 +80,15 @@ fn encodes_cbr_stereo_wav_end_to_end() {
 }
 
 #[test]
-fn encodes_abr_wav_end_to_end() {
-    let input = scratch_path("abr-in.wav");
-    let output = scratch_path("abr-out.mp3");
+fn abr_vbr_rejected_with_clear_message() {
+    // VBR/ABR are not yet implemented — verifying the CLI surfaces this
+    // clearly rather than silently producing fixed 128 kbps CBR output
+    // (see docs/mejoras.md §2.2).
+    let input = scratch_path("reject-in.wav");
+    let output = scratch_path("reject-out.mp3");
     write_test_wav(&input, 44_100, 2, 4096);
 
-    let result = run_cli(&[
+    let abr = run_cli(&[
         input.to_str().unwrap(),
         "-o",
         output.to_str().unwrap(),
@@ -93,24 +96,16 @@ fn encodes_abr_wav_end_to_end() {
         "128",
     ]);
     assert!(
-        result.status.success(),
-        "ABR encode failed: {}",
-        String::from_utf8_lossy(&result.stderr)
+        !abr.status.success(),
+        "ABR must be rejected (not yet implemented)"
+    );
+    let stderr = String::from_utf8_lossy(&abr.stderr);
+    assert!(
+        stderr.contains("not yet implemented"),
+        "ABR rejection must surface clearly, got: {stderr}"
     );
 
-    let mp3_bytes = std::fs::read(&output).expect("read ABR output");
-    assert_looks_like_mpeg1_layer3(&mp3_bytes);
-    let _ = std::fs::remove_file(&input);
-    let _ = std::fs::remove_file(&output);
-}
-
-#[test]
-fn encodes_vbr_wav_end_to_end() {
-    let input = scratch_path("vbr-in.wav");
-    let output = scratch_path("vbr-out.mp3");
-    write_test_wav(&input, 44_100, 2, 4096);
-
-    let result = run_cli(&[
+    let vbr = run_cli(&[
         input.to_str().unwrap(),
         "-o",
         output.to_str().unwrap(),
@@ -118,20 +113,16 @@ fn encodes_vbr_wav_end_to_end() {
         "4",
     ]);
     assert!(
-        result.status.success(),
-        "VBR encode failed: {}",
-        String::from_utf8_lossy(&result.stderr)
+        !vbr.status.success(),
+        "VBR must be rejected (not yet implemented)"
+    );
+    let stderr = String::from_utf8_lossy(&vbr.stderr);
+    assert!(
+        stderr.contains("not yet implemented"),
+        "VBR rejection must surface clearly, got: {stderr}"
     );
 
-    let mp3_bytes = std::fs::read(&output).expect("read VBR output");
-    assert_looks_like_mpeg1_layer3(&mp3_bytes);
-    // Not asserting VBR actually varies bitrate here -- mp3-core doesn't
-    // implement real VBR bitrate-index selection yet (documented M8
-    // scope limitation, `RateControl::nominal_bitrate` falls back to a
-    // fixed 128 kbps for `Vbr`); this only confirms the CLI plumbs the
-    // flag through to a valid encoder without erroring.
     let _ = std::fs::remove_file(&input);
-    let _ = std::fs::remove_file(&output);
 }
 
 #[test]

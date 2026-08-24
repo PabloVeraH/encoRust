@@ -13,10 +13,6 @@
 //!
 //! Verfied via perfect-reconstruction test (inverse MDCT + overlap-add)
 //! in this module's test suite — see `docs/mp3-encoder/06-phase3 §6`.
-//!
-//! Loop style follows range-based indexing throughout, matching the
-//! standard's own subscript notation — hence the clippy exception below.
-#![allow(clippy::needless_range_loop)]
 
 use core::f32::consts::PI;
 
@@ -74,7 +70,11 @@ pub fn short_window() -> [f32; 12] {
 /// | 18..=23 | 1.0 |
 /// | 24..=29 | sin(π/12 * (i-18+0.5)) |
 /// | 30..=35 | 0.0 |
+// Range-based indexing here matches the piecewise table documented
+// above, one clause per row; an iterator/enumerate rewrite would
+// obscure that 1:1 correspondence rather than clarify it.
 #[rustfmt::skip]
+#[allow(clippy::needless_range_loop)]
 pub fn start_window() -> [f32; 36] {
     let mut w = [0.0f32; 36];
     for i in 0..=17 {
@@ -98,7 +98,9 @@ pub fn start_window() -> [f32; 36] {
 /// | 6..=11 | sin(π/12 * (i-6+0.5)) |
 /// | 12..=17 | 1.0 |
 /// | 18..=35 | sin(π/36 * (i+0.5)) |
+// Same rationale as `start_window` above.
 #[rustfmt::skip]
+#[allow(clippy::needless_range_loop)]
 pub fn stop_window() -> [f32; 36] {
     let mut w = [0.0f32; 36];
     // 0..=5 stay 0.0
@@ -139,8 +141,8 @@ pub fn mdct_36(z: &[f32; 36]) -> [f32; 18] {
     for (k, item) in out.iter_mut().enumerate() {
         let omega = PI / 36.0 * (2.0 * k as f32 + 1.0);
         let mut sum = 0.0;
-        for n in 0..36 {
-            sum += z[n] * cos((n as f32 + 9.5) * omega);
+        for (n, &zn) in z.iter().enumerate() {
+            sum += zn * cos((n as f32 + 9.5) * omega);
         }
         *item = sum;
     }
@@ -155,8 +157,8 @@ pub fn mdct_12(z: &[f32; 12]) -> [f32; 6] {
     for (k, item) in out.iter_mut().enumerate() {
         let omega = PI / 12.0 * (2.0 * k as f32 + 1.0);
         let mut sum = 0.0;
-        for n in 0..12 {
-            sum += z[n] * cos((n as f32 + 3.5) * omega);
+        for (n, &zn) in z.iter().enumerate() {
+            sum += zn * cos((n as f32 + 3.5) * omega);
         }
         *item = sum;
     }
@@ -165,21 +167,23 @@ pub fn mdct_12(z: &[f32; 12]) -> [f32; 6] {
 
 /// Transform one subband for long/start/stop blocks: concatenate
 /// `prev_tail` (old) + `input` (new) → window → forward MDCT.
+///
+/// `window` should be precomputed once per block type (`long_window()`,
+/// etc.) and reused across all 32 subbands — see `docs/mejoras.md` §3.2
+/// M-4.
 pub fn transform_long(
     input: &[f32; 18],
     prev_tail: &[f32; 18],
-    block_type: BlockType,
+    window: &[f32; 36],
 ) -> ([f32; 18], [f32; 18]) {
-    let w = window_for_type(block_type);
     let mut z = [0.0f32; 36];
     for i in 0..18 {
-        z[i] = prev_tail[i] * w[i];
+        z[i] = prev_tail[i] * window[i];
     }
     for i in 0..18 {
-        z[i + 18] = input[i] * w[i + 18];
+        z[i + 18] = input[i] * window[i + 18];
     }
     let spectrum = mdct_36(&z);
-    // Return the spectrum AND the input samples as the next prev_tail
     (spectrum, *input)
 }
 
@@ -208,13 +212,13 @@ pub fn transform_short(windows: &[[f32; 12]; 3]) -> [[f32; 6]; 3] {
 fn imdct_36(spec: &[f32; 18]) -> [f32; 36] {
     let mut out = [0.0f32; 36];
     let scale = 2.0 / 18.0;
-    for n in 0..36 {
+    for (n, out_n) in out.iter_mut().enumerate() {
         let omega = PI / 36.0 * (n as f32 + 9.5);
         let mut sum = 0.0;
-        for k in 0..18 {
-            sum += spec[k] * cos((2.0 * k as f32 + 1.0) * omega);
+        for (k, &spec_k) in spec.iter().enumerate() {
+            sum += spec_k * cos((2.0 * k as f32 + 1.0) * omega);
         }
-        out[n] = sum * scale;
+        *out_n = sum * scale;
     }
     out
 }
@@ -224,13 +228,13 @@ fn imdct_36(spec: &[f32; 18]) -> [f32; 36] {
 fn imdct_12(spec: &[f32; 6]) -> [f32; 12] {
     let mut out = [0.0f32; 12];
     let scale = 2.0 / 6.0;
-    for n in 0..12 {
+    for (n, out_n) in out.iter_mut().enumerate() {
         let omega = PI / 12.0 * (n as f32 + 3.5);
         let mut sum = 0.0;
-        for k in 0..6 {
-            sum += spec[k] * cos((2.0 * k as f32 + 1.0) * omega);
+        for (k, &spec_k) in spec.iter().enumerate() {
+            sum += spec_k * cos((2.0 * k as f32 + 1.0) * omega);
         }
-        out[n] = sum * scale;
+        *out_n = sum * scale;
     }
     out
 }
@@ -304,6 +308,11 @@ pub fn antialias_butterfly(
 }
 
 #[cfg(test)]
+// Test fixtures/expected-value construction mirrors the standard's own
+// subscript notation throughout this module — see the module doc
+// comment above. Scoped to `tests` only; production code no longer
+// carries this allow (see docs/mejoras.md §7 item 6).
+#[allow(clippy::needless_range_loop, clippy::disallowed_methods)]
 mod tests {
     use super::*;
 
@@ -471,7 +480,8 @@ mod tests {
     fn transform_long_returns_prev_as_tail() {
         let input = [0.5f32; 18];
         let prev = [0.25f32; 18];
-        let (spec, next_tail) = transform_long(&input, &prev, BlockType::Long);
+        let window = long_window();
+        let (spec, next_tail) = transform_long(&input, &prev, &window);
         assert_eq!(next_tail, input, "next_tail should be the input samples");
         assert_eq!(spec.len(), 18);
     }

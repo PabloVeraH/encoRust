@@ -160,11 +160,14 @@ fn block_type_bits(bt: BlockType) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Pre-existing no_std-test gap — see the identical note in
+    // bitstream/scalefactor_encode.rs's test module.
     use crate::bitstream::writer::BitWriter;
     use crate::huffman::encode::HuffmanSideInfo;
     use crate::mdct::BlockType;
     use crate::quantize::{QuantizationResult, ScaleFactors};
     use crate::types::ChannelMode;
+    use alloc::vec::Vec;
 
     struct BitReader<'a> {
         data: &'a [u8],

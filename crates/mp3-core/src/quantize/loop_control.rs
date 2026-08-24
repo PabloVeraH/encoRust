@@ -3,8 +3,6 @@
 //! algorithmic heart of the encoder, where quality/bitrate trade-offs
 //! actually happen.
 
-#![allow(clippy::needless_range_loop)]
-
 use crate::mdct::BlockType;
 use crate::psychoacoustic::ScalefactorBandSmr;
 use crate::psychoacoustic::{
@@ -13,7 +11,12 @@ use crate::psychoacoustic::{
 };
 use crate::quantize::scalefactors::ScaleFactors;
 
-use libm::powf;
+// f32::abs() is std-only under this crate's MSRV (1.82) when built
+// `--no-default-features` for wasm32 — pre-existing latent breakage,
+// invisible until `rust-toolchain.toml` pinned a real 1.82 build (see
+// docs/mejoras.md's review notes). Use libm::fabsf, same as every other
+// transcendental function in this crate.
+use libm::{fabsf, powf};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -102,7 +105,7 @@ fn quantize_spectrum(
         let b = band_of_line[i];
         let sf_gain = scalefac_value(scalefac[b], scalefac_scale) as f32;
         let step_eff = step - sf_gain;
-        let scaled = spectrum[i].abs() * powf(2.0, -STEP_SCALE * step_eff);
+        let scaled = fabsf(spectrum[i]) * powf(2.0, -STEP_SCALE * step_eff);
         let ix_float = powf(scaled, QUANT_POW_ENCODE) - QUANT_OFFSET;
         ix_out[i] = if ix_float > 0.0 {
             (ix_float + 0.5) as i32
@@ -234,9 +237,9 @@ fn build_band_map(sfb_idx: usize, block_type: BlockType) -> [usize; 576] {
             let count = SFB_LONG_COUNTS[sfb_idx];
             for b in 0..count {
                 let start = bounds[b];
-                let end = bounds[b + 1];
-                for i in start..end.min(576) {
-                    map[i] = b;
+                let end = bounds[b + 1].min(576);
+                if end > start {
+                    map[start..end].fill(b);
                 }
             }
         }
@@ -245,9 +248,9 @@ fn build_band_map(sfb_idx: usize, block_type: BlockType) -> [usize; 576] {
             let count = SFB_SHORT_COUNTS[sfb_idx];
             for b in 0..count {
                 let start = bounds[b] * 3;
-                let end = bounds[b + 1] * 3;
-                for i in start..end.min(576) {
-                    map[i] = b;
+                let end = (bounds[b + 1] * 3).min(576);
+                if end > start {
+                    map[start..end].fill(b);
                 }
             }
         }
@@ -471,6 +474,8 @@ pub fn quantize_granule(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+// Scoped to `tests` only — see docs/mejoras.md §7 item 6.
+#[allow(clippy::needless_range_loop)]
 mod tests {
     use super::*;
     use libm::{sinf as sin, sqrtf as sqrt};

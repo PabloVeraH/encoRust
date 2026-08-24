@@ -21,7 +21,7 @@ use mp3_core::bitstream::writer::BitWriter;
 use mp3_core::bitstream::{frame_bytes_for_bitrate, split_bits_for_granules, BitReservoir};
 use mp3_core::filterbank::PolyphaseFilterbank;
 use mp3_core::huffman::encode_granule;
-use mp3_core::mdct::{antialias_butterfly, transform_long, BlockType};
+use mp3_core::mdct::{antialias_butterfly, long_window, transform_long, BlockType};
 use mp3_core::psychoacoustic::PsychoacousticModel;
 use mp3_core::quantize::quantize_granule;
 use mp3_core::types::{Bitrate, SampleRate, SUBBANDS};
@@ -55,8 +55,9 @@ fn encode_one_granule(
 
     // MDCT per subband (long blocks throughout), then antialiasing.
     let mut spectrum = [[0.0f32; 18]; SUBBANDS];
+    let mdct_window = long_window();
     for sb in 0..SUBBANDS {
-        let (spec, new_tail) = transform_long(&subband_time[sb], &prev_tail[sb], BlockType::Long);
+        let (spec, new_tail) = transform_long(&subband_time[sb], &prev_tail[sb], &mdct_window);
         spectrum[sb] = spec;
         prev_tail[sb] = new_tail;
     }
@@ -88,7 +89,15 @@ fn make_pcm(num_granules: usize, amplitude: f32, sample_rate_hz: u32) -> Vec<f32
     let mut pcm = Vec::with_capacity(num_granules * 576);
     for i in 0..(num_granules * 576) {
         let t = i as f32 / sample_rate_hz as f32;
-        pcm.push(amplitude * (2.0 * core::f32::consts::PI * 440.0 * t).sin());
+        // clippy.toml's disallowed-methods bans f32::sin because it's
+        // std-only and breaks the no_std/wasm build — but this is an
+        // integration test binary under `tests/`, which always links
+        // std and never compiles for wasm32/no_std, and `libm` isn't a
+        // dev-dependency of this crate (it's mp3-core's own production
+        // dependency, not visible here). Genuinely safe here.
+        #[allow(clippy::disallowed_methods)]
+        let s = (2.0 * core::f32::consts::PI * 440.0 * t).sin();
+        pcm.push(amplitude * s);
     }
     pcm
 }
@@ -132,6 +141,7 @@ fn cbr_average_bitrate_matches_configured_target() {
     let mut filterbank = PolyphaseFilterbank::new();
     let mut prev_tail = [[0.0f32; 18]; SUBBANDS];
     let mut psy = PsychoacousticModel::new();
+    psy.init_for_sample_rate(hz);
     let mut reservoir = BitReservoir::new(BitReservoir::max_for_version(version));
     let mut padding_acc = 0u32;
 
@@ -229,6 +239,7 @@ fn vbr_style_unconstrained_budget_produces_varying_frame_sizes() {
     let mut filterbank = PolyphaseFilterbank::new();
     let mut prev_tail = [[0.0f32; 18]; SUBBANDS];
     let mut psy = PsychoacousticModel::new();
+    psy.init_for_sample_rate(hz);
 
     // loud -> quiet -> loud, 8 granules each (matches the DoD's
     // "loud-then-quiet-then-loud synthetic fixture").

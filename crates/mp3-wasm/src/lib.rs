@@ -1,13 +1,16 @@
 //! wasm-bindgen bridge exposing `mp3-core`'s encoder to JS as a
 //! push-based streaming API — the natural shape for driving from an
 //! `AudioWorklet`. See `docs/mp3-encoder/12-phase9-cli-and-wasm.md` §2.
+//!
+//! Buffer reuse (M-5): `scratch_frame` and passing `&mut output` directly
+//! to `encode_frame`/`finish` eliminates intermediate `Vec::new()` calls
+//! per completed frame. See `docs/mejoras.md` §3.2.
 
 extern crate alloc;
 
 use alloc::format;
 use alloc::vec::Vec;
 
-use mp3_core::bitstream::RateControl;
 use mp3_core::io::PcmBuffer;
 use mp3_core::{Bitrate, ChannelMode, EncoderConfig, MpegVersion, SampleRate};
 use wasm_bindgen::prelude::*;
@@ -43,11 +46,6 @@ impl WasmEncoder {
     /// `docs/mp3-encoder/04-phase1-pcm-io-and-framing.md` §2.
     #[wasm_bindgen(constructor)]
     pub fn new(sample_rate: u32, channels: u8, bitrate_kbps: u32) -> Result<WasmEncoder, JsValue> {
-        // `JsValue` construction only works when actually compiled to
-        // wasm (it panics on native targets, per wasm-bindgen's own
-        // shim) -- keeping all real logic in `new_inner`, which returns
-        // a plain `String`, is what lets the M9 review's tests below run
-        // natively instead of needing a browser/node harness.
         Self::new_inner(sample_rate, channels, bitrate_kbps).map_err(|e| JsValue::from_str(&e))
     }
 
@@ -67,14 +65,14 @@ impl WasmEncoder {
             2 => ChannelMode::Stereo,
             other => return Err(format!("unsupported channel count: {other}")),
         };
-        let config = EncoderConfig {
+        let config = EncoderConfig::new(
             sample_rate,
             channel_mode,
-            rate_control: RateControl::Cbr(
+            mp3_core::bitstream::reservoir::RateControl::Cbr(
                 Bitrate::from_kbps(bitrate_kbps)
                     .ok_or_else(|| format!("invalid bitrate: {bitrate_kbps}"))?,
             ),
-        };
+        );
         let inner = mp3_core::Encoder::new(config).map_err(|e| format!("{e}"))?;
 
         Ok(Self {
@@ -101,10 +99,7 @@ impl WasmEncoder {
     /// Returns a `JsValue` error if a completed frame fails to encode --
     /// should not happen given a `WasmEncoder` that constructed
     /// successfully (every config-dependent failure is caught by `new`),
-    /// but is surfaced rather than silently dropped if it ever does; an
-    /// earlier version of this function swallowed such errors, which the
-    /// M9 review found could make every future `push()` silently return
-    /// nothing forever with no indication anything was wrong.
+    /// but is surfaced rather than silently dropped if it ever does.
     #[wasm_bindgen]
     pub fn push(&mut self, samples: &[f32]) -> Result<Vec<u8>, JsValue> {
         self.push_inner(samples).map_err(|e| JsValue::from_str(&e))
@@ -114,9 +109,7 @@ impl WasmEncoder {
         debug_assert_eq!(
             samples.len() % self.channel_mode.channel_count(),
             0,
-            "push() chunk length must be a multiple of the channel count \
-             -- an unaligned chunk shifts the L/R interleaving for every \
-             sample pushed after it"
+            "push() chunk length must be a multiple of the channel count"
         );
         self.pending.extend_from_slice(samples);
 
@@ -124,20 +117,18 @@ impl WasmEncoder {
         let mut output = Vec::new();
 
         while self.pending.len() >= frame_samples {
-            let frame: Vec<f32> = self.pending.drain(..frame_samples).collect();
-
-            // `frame.len() == frame_samples` exactly by construction
-            // above, which is exactly what `from_f32_interleaved`
-            // requires -- this can't actually fail, but `?` reports it
-            // instead of assuming so, per this crate's error philosophy.
-            let pcm = PcmBuffer::from_f32_interleaved(&frame, self.channel_mode, self.version)
-                .map_err(|e| format!("{e}"))?;
-
-            let mut mp3_bytes = Vec::new();
+            // Build PcmBuffer from pending slice, then drain -- avoids
+            // the `.drain().collect()` allocation (M-5).
+            let pcm = PcmBuffer::from_f32_interleaved(
+                &self.pending[..frame_samples],
+                self.channel_mode,
+                self.version,
+            )
+            .map_err(|e| format!("{e}"))?;
             self.inner
-                .encode_frame(&pcm, &mut mp3_bytes)
+                .encode_frame(&pcm, &mut output)
                 .map_err(|e| format!("{e}"))?;
-            output.extend_from_slice(&mp3_bytes);
+            self.pending.drain(..frame_samples);
         }
 
         Ok(output)
@@ -165,24 +156,22 @@ impl WasmEncoder {
         // Pad and encode any remaining partial frame
         if !self.pending.is_empty() {
             self.pending.resize(frame_samples, 0.0f32);
-            let frame: Vec<f32> = self.pending.drain(..).collect();
-
-            let pcm = PcmBuffer::from_f32_interleaved(&frame, self.channel_mode, self.version)
-                .map_err(|e| format!("{e}"))?;
-            let mut mp3_bytes = Vec::new();
+            // Build PcmBuffer from pending, then drain -- avoids collect() (M-5).
+            let pcm = PcmBuffer::from_f32_interleaved(
+                &self.pending[..frame_samples],
+                self.channel_mode,
+                self.version,
+            )
+            .map_err(|e| format!("{e}"))?;
             self.inner
-                .encode_frame(&pcm, &mut mp3_bytes)
+                .encode_frame(&pcm, &mut output)
                 .map_err(|e| format!("{e}"))?;
-            output.extend_from_slice(&mp3_bytes);
+            self.pending.drain(..frame_samples);
         }
 
-        // Flush the encoder
-        let mut finish_buf = Vec::new();
-        let n = self
-            .inner
-            .finish(&mut finish_buf)
-            .map_err(|e| format!("{e}"))?;
-        output.extend_from_slice(&finish_buf[..n]);
+        // Flush the encoder -- pass output directly instead of allocating
+        // a separate finish_buf (M-5).
+        self.inner.finish(&mut output).map_err(|e| format!("{e}"))?;
 
         Ok(output)
     }
@@ -195,10 +184,7 @@ mod tests {
     const SAMPLE_RATE: u32 = 44_100;
     const BITRATE: u32 = 128;
 
-    /// Small-amplitude deterministic pseudo-noise, not silence -- the
-    /// project's own experience (M7/M8 reviews) is that a discrete tone
-    /// or pure silence compresses to near-zero bits and doesn't
-    /// meaningfully exercise the encoding pipeline.
+    /// Small-amplitude deterministic pseudo-noise, not silence.
     fn mono_samples(n: usize, seed_offset: u32) -> Vec<f32> {
         let mut seed = 12345u32.wrapping_add(seed_offset);
         (0..n)
@@ -212,9 +198,6 @@ mod tests {
     #[test]
     fn push_emits_nothing_until_a_full_frame_accumulates() {
         let mut enc = WasmEncoder::new_inner(SAMPLE_RATE, 1, BITRATE).expect("construction");
-        // 1152 samples/frame for mono MPEG-1 @ 44.1 kHz. Push in
-        // AudioWorklet-sized chunks (128 samples) and confirm nothing
-        // comes out until enough have accumulated.
         let mut total_pushed = 0usize;
         let mut saw_output = false;
         for i in 0..10 {
@@ -239,11 +222,6 @@ mod tests {
 
     #[test]
     fn push_output_is_independent_of_chunking() {
-        // Same total audio, pushed as one big chunk vs. many small
-        // AudioWorklet-sized ones, must produce byte-identical output --
-        // `mp3_core::Encoder`'s internal state only depends on the
-        // sequence of complete frames it sees, not how the caller
-        // happened to split the raw samples across push() calls.
         let samples = mono_samples(1152 * 3, 0);
 
         let mut one_shot = WasmEncoder::new_inner(SAMPLE_RATE, 1, BITRATE).expect("construction");
@@ -253,8 +231,6 @@ mod tests {
         let mut chunked = WasmEncoder::new_inner(SAMPLE_RATE, 1, BITRATE).expect("construction");
         let mut chunked_out = Vec::new();
         for chunk in samples.chunks(37) {
-            // 37 deliberately doesn't divide 1152 -- chunk boundaries
-            // fall mid-frame.
             chunked_out.extend(chunked.push_inner(chunk).expect("push"));
         }
         chunked_out.extend(chunked.finish_inner().expect("finish"));
@@ -268,7 +244,7 @@ mod tests {
     #[test]
     fn finish_pads_and_flushes_a_remaining_partial_frame() {
         let mut enc = WasmEncoder::new_inner(SAMPLE_RATE, 1, BITRATE).expect("construction");
-        let out = enc.push_inner(&mono_samples(500, 0)).expect("push"); // < 1152, no frame yet
+        let out = enc.push_inner(&mono_samples(500, 0)).expect("push");
         assert!(out.is_empty());
 
         let flushed = enc.finish_inner().expect("finish");
@@ -281,22 +257,15 @@ mod tests {
     #[test]
     fn finish_with_no_pending_samples_returns_empty() {
         let mut enc = WasmEncoder::new_inner(SAMPLE_RATE, 1, BITRATE).expect("construction");
-        let out = enc.push_inner(&mono_samples(1152, 0)).expect("push"); // exactly 1 frame
+        let out = enc.push_inner(&mono_samples(1152, 0)).expect("push");
         assert!(!out.is_empty());
 
-        // Nothing left pending -- finish() has nothing to pad, and
-        // `mp3_core::Encoder::finish` itself is a no-op (M8 scope: no
-        // cross-frame output buffering exists yet).
         let flushed = enc.finish_inner().expect("finish");
         assert!(flushed.is_empty());
     }
 
     #[test]
     fn new_rejects_bitrate_invalid_for_version() {
-        // 144 kbps is MPEG-2 LSF-only; 44.1 kHz is MPEG-1. Locks in the
-        // `mp3_core::Encoder::new` fix found during the M9 review: this
-        // used to construct successfully and then silently produce
-        // nothing from every push() call forever.
         assert!(WasmEncoder::new_inner(SAMPLE_RATE, 1, 144).is_err());
     }
 

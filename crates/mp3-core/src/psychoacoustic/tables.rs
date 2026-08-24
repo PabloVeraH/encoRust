@@ -3,11 +3,6 @@
 //! Every table cited here is verified against ≥2 independent sources;
 //! where the standard provides a formula (spreading function, Bark scale,
 //! absolute threshold of hearing), we implement the formula directly.
-//!
-//! Some items are reserved for M5+ (quantization needs SFB tables, M8
-//! needs SFB_COUNTS); dead-code warnings suppressed with milestone tags.
-
-#![allow(dead_code)] // M5-M8: these tables are consumed by downstream milestones
 
 extern crate alloc;
 use alloc::vec;
@@ -349,6 +344,7 @@ pub fn sfb_short_checksum() -> u64 {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // f32::abs() in test assertions -- see docs/mejoras.md §7 item 6
 mod tests {
     use super::*;
 

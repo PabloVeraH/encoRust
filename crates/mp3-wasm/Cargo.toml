@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "wasm-bindgen bridge exposing mp3-core's streaming encode API to JS."
+readme = "../../README.md"
 
 [lib]
 crate-type = ["cdylib", "rlib"]

@@ -13,6 +13,7 @@ use libm::roundf;
 /// How the encoder allocates bits across frames. See
 /// `docs/mp3-encoder/10-phase7-bit-reservoir-and-rate-control.md` §4.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub enum RateControl {
     /// Fixed nominal bitrate per frame; the reservoir only smooths local
     /// complexity spikes — average output bitrate equals the target
@@ -252,6 +253,7 @@ pub fn split_bits_for_granules(total_bits: u32, pe_granule0: f32, pe_granule1: f
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // f32::abs() in test assertions -- see docs/mejoras.md §7 item 6
 mod tests {
     use super::*;
 

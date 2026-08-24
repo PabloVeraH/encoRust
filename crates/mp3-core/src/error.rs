@@ -9,6 +9,7 @@
 
 /// Errors returned by `mp3-core`'s public API.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum EncodeError {
     /// The requested sample rate is not one of the six defined by
     /// ISO/IEC 11172-3 (MPEG-1) or ISO/IEC 13818-3 (MPEG-2 LSF).
@@ -53,5 +54,16 @@ pub enum EncodeError {
     UnsupportedChannelMode {
         /// The rejected channel mode.
         mode: crate::types::ChannelMode,
+    },
+
+    /// The requested [`crate::bitstream::reservoir::RateControl`] mode
+    /// is not yet implemented: VBR and ABR are placeholders that silently
+    /// produce fixed 128 kbps CBR output with no warning. Fail loudly
+    /// instead of silently ignoring the user's request. See
+    /// `docs/mejoras.md` §2.2.
+    #[error("rate-control mode not yet implemented by this encoder: {variant}")]
+    UnsupportedRateControl {
+        /// The rejected rate-control variant ("Vbr" or "Abr").
+        variant: &'static str,
     },
 }
