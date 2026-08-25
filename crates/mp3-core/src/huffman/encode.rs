@@ -3,6 +3,7 @@
 //! `docs/mp3-encoder/09-phase6-huffman-coding.md` §3-4.
 
 use crate::bitstream::writer::BitWriter;
+use crate::mdct::BlockType;
 use crate::psychoacoustic::SFB_LONG_BOUNDARIES;
 use crate::types::SAMPLES_PER_GRANULE;
 
@@ -273,6 +274,94 @@ pub fn estimate_bits(ix: &[i32; SAMPLES_PER_GRANULE]) -> u32 {
     bits
 }
 
+/// `big_values` region boundaries actually used to encode, computed
+/// **once** and reused for both table selection and the byte-encoding
+/// loop in [`encode_granule`].
+///
+/// An earlier version of the window-switching (`block_type != Long`)
+/// path computed this split three separate ways: one boundary to pick
+/// `table_select[0]` (via [`Regions::r0_end`], a long-block-shaped 1/3
+/// point), a *different* boundary to actually write the encoded bytes
+/// (via `count_sf_bands_for_pairs` on a 1/2 point), and a *third* value
+/// for the (unsignaled, for this case) `region0_count`/`region1_count`
+/// bookkeeping fields. Because the table was chosen by looking at a
+/// smaller range than the one it was then applied to, a table picked as
+/// `0` (meaning "no big-values here, skip") for the narrower range could
+/// silently drop real values that existed only in the gap between the
+/// two boundaries — data loss, not just a suboptimal table choice. This
+/// type exists so that class of bug is structurally impossible: there is
+/// exactly one boundary computation, used everywhere.
+///
+/// **Standards-compliance caveat (window-switching case only):**
+/// `region0_count`/`region1_count` are never transmitted when
+/// `window_switching_flag == 1` (`SideInfo::write` omits them — see
+/// `bitstream/side_info.rs`), so a real decoder derives its own
+/// region0/1 boundary from ISO/IEC 11172-3 Annex B's fixed rule for that
+/// case, independent of anything this encoder chooses. The split
+/// computed below (half of `big_values_end`, rounded to a scalefactor-
+/// band boundary) is *not yet cross-checked against that fixed table* —
+/// it removes the internal inconsistency above, but has not been
+/// verified to match what an external decoder (Symphonia/LAME/ffmpeg)
+/// expects. Do not treat window-switching output as interoperability-
+/// verified until a differential decode test on transient content
+/// (Start/Short/Stop-triggering material) passes — see `docs/plus.md`
+/// M11.6/M11.7.
+struct RegionSplit {
+    /// Up to 3 `(start, end)` sample ranges; only `[..n_regions]` valid.
+    ranges: [(usize, usize); 3],
+    /// 2 for window-switching blocks, 3 for `Long`.
+    n_regions: usize,
+    /// `region0_count`/`region1_count` — transmitted for `Long`,
+    /// computed-but-unused (see caveat above) for window-switching.
+    region0_count: u8,
+    region1_count: u8,
+}
+
+impl RegionSplit {
+    fn compute(
+        block_type: BlockType,
+        big_values_end: usize,
+        regions: &Regions,
+        band_end: &[usize; SF_BAND_COUNT],
+    ) -> Self {
+        let pairs_count = big_values_end / 2;
+        if block_type == BlockType::Long {
+            let third = pairs_count / 3;
+            let region0_count = count_sf_bands_for_pairs(third, band_end) as u8;
+            let region1_count = count_sf_bands_for_pairs(third * 2, band_end) as u8;
+            Self {
+                ranges: [
+                    (0, regions.r0_end),
+                    (regions.r0_end, regions.r1_end),
+                    (regions.r1_end, big_values_end),
+                ],
+                n_regions: 3,
+                region0_count,
+                region1_count,
+            }
+        } else {
+            // window_switching_flag == 1: 2 regions. Split at the
+            // nearest scalefactor-band boundary to the midpoint of
+            // big_values, rounded via the same `count_sf_bands_for_pairs`
+            // helper the Long case uses (keeps both cases' boundaries
+            // band-aligned, consistent with how `build_band_map` in
+            // `quantize/loop_control.rs` already treats short-block
+            // bands). See this type's doc comment for what's still
+            // unverified about this specific split point.
+            let half = pairs_count / 2;
+            let band_count = count_sf_bands_for_pairs(half, band_end);
+            let mid =
+                band_end[band_count.saturating_sub(1).min(band_end.len() - 1)].min(big_values_end);
+            Self {
+                ranges: [(0, mid), (mid, big_values_end), (0, 0)],
+                n_regions: 2,
+                region0_count: band_count as u8,
+                region1_count: 0,
+            }
+        }
+    }
+}
+
 /// Map a signed value to unsigned index for count1 encoding:
 /// 0 -> 0, 1 -> 1, -1 -> 1. Signs are emitted separately.
 fn signed_to_index(v: i32) -> usize {
@@ -298,8 +387,16 @@ fn count_sf_bands_for_pairs(pairs: usize, band_end: &[usize; SF_BAND_COUNT]) -> 
 /// bits via `writer`. Called once per granule, after the quantization
 /// loop has converged. See
 /// `docs/mp3-encoder/09-phase6-huffman-coding.md` §3-4.
+///
+/// When `block_type != Long` (i.e. `window_switching_flag == 1` for
+/// Start/Short/Stop), only 2 big_values regions are used instead of 3;
+/// `region0_count`/`region1_count` are computed but never transmitted
+/// for this case (`SideInfo::write` omits them). See [`RegionSplit`]'s
+/// doc comment for the boundary computation and its standards-
+/// compliance caveat.
 pub fn encode_granule(
     ix: &[i32; SAMPLES_PER_GRANULE],
+    block_type: BlockType,
     writer: &mut BitWriter<'_>,
 ) -> HuffmanSideInfo {
     let band_end = sf_band_end();
@@ -309,29 +406,23 @@ pub fn encode_granule(
 
     let big_values_count = (big_values_end / 2) as u16;
 
-    // Region boundaries: split big_values into 3 roughly equal sub-regions
-    let pairs_count = big_values_end / 2;
-    let third = pairs_count / 3;
-    let region0_count = count_sf_bands_for_pairs(third, &band_end) as u8;
-    let region1_count = count_sf_bands_for_pairs(third * 2, &band_end) as u8;
+    // Region boundaries are computed exactly once here and reused for
+    // *both* table selection and the actual byte-encoding loop below —
+    // see `RegionSplit`'s doc comment for why that used to be three
+    // independently-computed (and disagreeing) values.
+    let split = RegionSplit::compute(block_type, big_values_end, &regions, &band_end);
+    let region0_count = split.region0_count;
+    let region1_count = split.region1_count;
 
-    let r0_start = 0;
-    let r0_end = regions.r0_end;
-    let r1_start = r0_end;
-    let r1_end = regions.r1_end;
-    let r2_start = r1_end;
-    let r2_end = big_values_end;
+    let mut table_select = [0u8; 3];
+    for (i, &(start, end)) in split.ranges.iter().enumerate().take(split.n_regions) {
+        table_select[i] = choose_table(ix, start, end);
+    }
 
-    let table0 = choose_table(ix, r0_start, r0_end);
-    let table1 = choose_table(ix, r1_start, r1_end);
-    let table2 = choose_table(ix, r2_start, r2_end);
+    let regions_list = &split.ranges[..split.n_regions];
+    let region_tables = &table_select[..split.n_regions];
 
-    // Encode big_values pairs for each region
-    for (start, end, table_id) in [
-        (r0_start, r0_end, table0),
-        (r1_start, r1_end, table1),
-        (r2_start, r2_end, table2),
-    ] {
+    for (&(start, end), &table_id) in regions_list.iter().zip(region_tables.iter()) {
         if table_id == 0 {
             continue;
         }
@@ -465,7 +556,7 @@ pub fn encode_granule(
         big_values: big_values_count,
         region0_count,
         region1_count,
-        table_select: [table0, table1, table2],
+        table_select,
         count1table_select: use_table_1,
     }
 }
@@ -490,7 +581,7 @@ mod tests {
 
         let mut out = Vec::new();
         let mut writer = BitWriter::new(&mut out);
-        let _info = encode_granule(ix, &mut writer);
+        let _info = encode_granule(ix, BlockType::Long, &mut writer);
         writer.flush();
         let actual_bits = (out.len() * 8) as u32;
 
@@ -554,7 +645,7 @@ mod tests {
         let estimate = estimate_bits(&ix);
         let mut out = Vec::new();
         let mut writer = BitWriter::new(&mut out);
-        encode_granule(&ix, &mut writer);
+        encode_granule(&ix, BlockType::Long, &mut writer);
         writer.flush();
         let actual = (out.len() * 8) as u32;
 
@@ -571,7 +662,7 @@ mod tests {
         let ix = [0i32; SAMPLES_PER_GRANULE];
         let mut out = Vec::new();
         let mut writer = BitWriter::new(&mut out);
-        let _info = encode_granule(&ix, &mut writer);
+        let _info = encode_granule(&ix, BlockType::Long, &mut writer);
         writer.flush();
         assert!(out.is_empty());
     }
@@ -586,7 +677,7 @@ mod tests {
 
         let mut out = Vec::new();
         let mut writer = BitWriter::new(&mut out);
-        let info = encode_granule(&ix, &mut writer);
+        let info = encode_granule(&ix, BlockType::Long, &mut writer);
         writer.flush();
 
         assert_eq!(info.big_values, 0);
@@ -681,21 +772,40 @@ mod tests {
     /// gets the equivalent from `part2_3_length` (chapter 11, M8 scope);
     /// reconstructing that framing isn't needed to check the Huffman
     /// coding itself round-trips correctly.
+    ///
+    /// `block_type` selects the same [`RegionSplit`] computation
+    /// `encode_granule` used, so this rebuilds the *identical* boundary
+    /// rather than a hardcoded thirds-only split -- for `block_type ==
+    /// Long` this is unchanged from before; for window-switching block
+    /// types it exercises the 2-region path. Note this still isn't an
+    /// independent decoder: it derives the boundary the same way the
+    /// encoder does, so it proves internal self-consistency (the bug
+    /// documented on `RegionSplit`), not standards compliance -- see
+    /// that doc comment's caveat for window-switching blocks.
     fn decode_granule_for_test(
         data: &[u8],
         info: &HuffmanSideInfo,
+        block_type: BlockType,
         count1_end: usize,
     ) -> [i32; SAMPLES_PER_GRANULE] {
         let mut out = [0i32; SAMPLES_PER_GRANULE];
         let mut reader = BitReader::new(data);
 
         let pairs_count = info.big_values as usize;
+        let big_values_end = pairs_count * 2;
         let third = pairs_count / 3;
-        let region_bounds = [
-            (0usize, third * 2, info.table_select[0]),
-            (third * 2, third * 4, info.table_select[1]),
-            (third * 4, pairs_count * 2, info.table_select[2]),
-        ];
+        let regions = Regions {
+            big_values_end,
+            count1_end,
+            r0_end: third * 2,
+            r1_end: third * 4,
+        };
+        let band_end = sf_band_end();
+        let split = RegionSplit::compute(block_type, big_values_end, &regions, &band_end);
+        let mut region_bounds = [(0usize, 0usize, 0u8); 3];
+        for (i, &(s, e)) in split.ranges.iter().enumerate().take(split.n_regions) {
+            region_bounds[i] = (s, e, info.table_select[i]);
+        }
 
         for (start, end, table_id) in region_bounds {
             if table_id == 0 {
@@ -771,10 +881,10 @@ mod tests {
 
         let mut out = Vec::new();
         let mut writer = BitWriter::new(&mut out);
-        let info = encode_granule(&ix, &mut writer);
+        let info = encode_granule(&ix, BlockType::Long, &mut writer);
         writer.flush();
 
-        let decoded = decode_granule_for_test(&out, &info, last_nonzero_end(&ix));
+        let decoded = decode_granule_for_test(&out, &info, BlockType::Long, last_nonzero_end(&ix));
         assert_eq!(decoded, ix, "round-trip mismatch with escape-coded values");
     }
 
@@ -794,10 +904,10 @@ mod tests {
 
         let mut out = Vec::new();
         let mut writer = BitWriter::new(&mut out);
-        let info = encode_granule(&ix, &mut writer); // must not panic
+        let info = encode_granule(&ix, BlockType::Long, &mut writer); // must not panic
         writer.flush();
 
-        let decoded = decode_granule_for_test(&out, &info, last_nonzero_end(&ix));
+        let decoded = decode_granule_for_test(&out, &info, BlockType::Long, last_nonzero_end(&ix));
         assert_eq!(decoded, ix);
     }
 
@@ -816,10 +926,10 @@ mod tests {
 
         let mut out = Vec::new();
         let mut writer = BitWriter::new(&mut out);
-        let info = encode_granule(&ix, &mut writer);
+        let info = encode_granule(&ix, BlockType::Long, &mut writer);
         writer.flush();
 
-        let decoded = decode_granule_for_test(&out, &info, last_nonzero_end(&ix));
+        let decoded = decode_granule_for_test(&out, &info, BlockType::Long, last_nonzero_end(&ix));
         assert_eq!(decoded, ix, "magnitude-15 boundary did not round-trip");
     }
 
@@ -833,11 +943,76 @@ mod tests {
 
             let mut out = Vec::new();
             let mut writer = BitWriter::new(&mut out);
-            let info = encode_granule(&ix, &mut writer);
+            let info = encode_granule(&ix, BlockType::Long, &mut writer);
             writer.flush();
 
-            let decoded = decode_granule_for_test(&out, &info, last_nonzero_end(&ix));
+            let decoded = decode_granule_for_test(&out, &info, BlockType::Long, last_nonzero_end(&ix));
             prop_assert_eq!(decoded, ix);
+        }
+    }
+
+    /// Guards the specific bug `RegionSplit` closed: an earlier version of
+    /// `encode_granule`'s window-switching (`block_type != Long`) path
+    /// chose `table_select[0]` by inspecting only `[0, ~1/3 point)` but
+    /// then applied that table while actually encoding the larger range
+    /// `[0, ~1/2 point)` -- so a big-value pair placed strictly between
+    /// those two points could be encoded under a table (or dropped
+    /// entirely, if the narrower range looked all-zero and table 0 got
+    /// picked) that was never evaluated against it. This places non-zero
+    /// big-values exactly in that gap for all three window-switching
+    /// block types and checks they still round-trip exactly.
+    #[test]
+    fn window_switching_round_trips_values_in_the_old_gap_region() {
+        for block_type in [BlockType::Start, BlockType::Short, BlockType::Stop] {
+            let mut ix = [0i32; SAMPLES_PER_GRANULE];
+            // Old (buggy) region0 end was ~1/3 of big_values_end; old
+            // actual-encode split was ~1/2. Put distinctive big-values
+            // in [1/3, 1/2) of a granule with big_values_end well past
+            // both -- and nothing at all before that gap, so the old
+            // code's narrower `choose_table` range would have seen an
+            // all-zero region and picked table 0 (skip).
+            ix[220] = 12;
+            ix[221] = -9;
+            ix[222] = 30; // forces an escape-table choice
+            ix[223] = -30;
+            // Extend big_values_end well past the gap so the old
+            // "1/3 vs 1/2" boundaries actually differ from each other.
+            ix[400] = 5;
+            ix[401] = -3;
+
+            let mut out = Vec::new();
+            let mut writer = BitWriter::new(&mut out);
+            let info = encode_granule(&ix, block_type, &mut writer);
+            writer.flush();
+
+            let decoded = decode_granule_for_test(&out, &info, block_type, last_nonzero_end(&ix));
+            assert_eq!(
+                decoded, ix,
+                "{block_type:?}: values in the old gap region did not round-trip"
+            );
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn window_switching_round_trip_random_granules(
+            values in prop::collection::vec(-300i32..=300, 60),
+        ) {
+            for block_type in [BlockType::Start, BlockType::Short, BlockType::Stop] {
+                let mut ix = [0i32; SAMPLES_PER_GRANULE];
+                for (i, v) in values.iter().enumerate() {
+                    ix[i] = *v;
+                }
+
+                let mut out = Vec::new();
+                let mut writer = BitWriter::new(&mut out);
+                let info = encode_granule(&ix, block_type, &mut writer);
+                writer.flush();
+
+                let decoded =
+                    decode_granule_for_test(&out, &info, block_type, last_nonzero_end(&ix));
+                prop_assert_eq!(decoded, ix);
+            }
         }
     }
 
@@ -862,7 +1037,7 @@ mod tests {
 
         let mut out = Vec::new();
         let mut writer = BitWriter::new(&mut out);
-        let info = encode_granule(&ix, &mut writer);
+        let info = encode_granule(&ix, BlockType::Long, &mut writer);
         writer.flush();
 
         assert!(info.big_values > 0 || !out.is_empty());
