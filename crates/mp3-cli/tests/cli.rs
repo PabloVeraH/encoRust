@@ -81,9 +81,12 @@ fn encodes_cbr_stereo_wav_end_to_end() {
 
 #[test]
 fn abr_vbr_rejected_with_clear_message() {
-    // VBR/ABR are not yet implemented — verifying the CLI surfaces this
-    // clearly rather than silently producing fixed 128 kbps CBR output
-    // (see docs/mejoras.md §2.2).
+    // ABR and VBR are not yet implemented — verifying the CLI surfaces
+    // this clearly rather than silently producing fixed-bitrate CBR
+    // output (see docs/mejoras.md §2.2). An intermediate version of this
+    // branch accepted `--abr` while it behaved identically to CBR under
+    // the hood — reintroducing exactly the silent-no-op anti-pattern
+    // this test exists to catch; see docs/plus.md's review notes.
     let input = scratch_path("reject-in.wav");
     let output = scratch_path("reject-out.mp3");
     write_test_wav(&input, 44_100, 2, 4096);
@@ -123,6 +126,49 @@ fn abr_vbr_rejected_with_clear_message() {
     );
 
     let _ = std::fs::remove_file(&input);
+}
+
+#[test]
+fn joint_stereo_flag_encodes_successfully() {
+    let input = scratch_path("joint-stereo-in.wav");
+    let output = scratch_path("joint-stereo-out.mp3");
+    write_test_wav(&input, 44_100, 2, 4096);
+
+    let result = run_cli(&[
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--bitrate",
+        "128",
+        "--joint-stereo",
+    ]);
+    assert!(
+        result.status.success(),
+        "--joint-stereo must encode successfully, got: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let mp3_bytes = std::fs::read(&output).expect("read joint-stereo output");
+    assert_looks_like_mpeg1_layer3(&mp3_bytes);
+
+    let mono_input = scratch_path("joint-stereo-mono-in.wav");
+    write_test_wav(&mono_input, 44_100, 1, 4096);
+    let mono_result = run_cli(&[
+        mono_input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--bitrate",
+        "128",
+        "--joint-stereo",
+    ]);
+    assert!(
+        !mono_result.status.success(),
+        "--joint-stereo with mono input must be rejected"
+    );
+
+    let _ = std::fs::remove_file(&input);
+    let _ = std::fs::remove_file(&mono_input);
+    let _ = std::fs::remove_file(&output);
 }
 
 #[test]
