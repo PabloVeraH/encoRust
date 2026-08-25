@@ -38,6 +38,86 @@ pub enum BlockType {
     Stop,
 }
 
+/// Unified per-granule shape type that replaces bare [`BlockType`] in
+/// pipeline stages that must agree on window layout. Making the shape
+/// explicit instead of passing a `BlockType` to each stage independently
+/// turns "I forgot to wire block_type into stage X" into a compile error
+/// rather than a desynchronized bitstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GranuleShape {
+    /// Long block or transition block (Start/Stop — both use the 36-
+    /// sample MDCT window, only the window shape differs).
+    Long {
+        /// Which 36-sample window to use.
+        kind: LongWindowKind,
+    },
+    /// Three 12-sample short windows per granule (pure short; mixed
+    /// blocks deferred — see `docs/plus.md` §2, M11.1).
+    Short {
+        /// Whether this granule mixes in long subbands at low frequencies
+        /// (`mixed_block_flag=true`). Deferred for now; always `false`.
+        mixed: bool,
+    },
+}
+
+/// Specific type within the long-block window family. Start/Stop are
+/// transition windows that preserve energy at L↔S boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LongWindowKind {
+    /// Normal stationary-window.
+    Normal,
+    /// Transition into short blocks.
+    Start,
+    /// Transition back to long blocks.
+    Stop,
+}
+
+impl GranuleShape {
+    /// Converts from the psychoacoustic model's raw `BlockType` decision
+    /// into the unified shape. `Short` maps to `GranuleShape::Short`;
+    /// `Long`/`Start`/`Stop` all map to `GranuleShape::Long` with the
+    /// appropriate `LongWindowKind`.
+    #[must_use]
+    pub fn from_block_type(bt: BlockType, mixed: bool) -> Self {
+        match bt {
+            BlockType::Long => Self::Long {
+                kind: LongWindowKind::Normal,
+            },
+            BlockType::Start => Self::Long {
+                kind: LongWindowKind::Start,
+            },
+            BlockType::Short => Self::Short { mixed },
+            BlockType::Stop => Self::Long {
+                kind: LongWindowKind::Stop,
+            },
+        }
+    }
+
+    /// Returns the underlying `BlockType` for stages that still need it
+    /// (side-info serialization, scalefactor band lookup).
+    #[must_use]
+    pub fn block_type(&self) -> BlockType {
+        match self {
+            Self::Long { kind } => match kind {
+                LongWindowKind::Normal => BlockType::Long,
+                LongWindowKind::Start => BlockType::Start,
+                LongWindowKind::Stop => BlockType::Stop,
+            },
+            Self::Short { .. } => BlockType::Short,
+        }
+    }
+
+    /// Whether this granule uses short windows (`window_switching_flag=1`
+    /// in side info). True for `Short`, `Start`, `Stop`; false for `Long`.
+    #[must_use]
+    pub fn is_window_switching(&self) -> bool {
+        match self {
+            Self::Long { kind } => !matches!(kind, LongWindowKind::Normal),
+            Self::Short { .. } => true,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Window functions (closed-form trigonometric, per Annex B)
 // ---------------------------------------------------------------------------
@@ -114,6 +194,16 @@ pub fn stop_window() -> [f32; 36] {
         w[i] = sin(PI / 36.0 * (i as f32 + 0.5));
     }
     w
+}
+
+/// Returns the 36-sample window for a long-block kind. Short blocks use
+/// the 12-sample short window (applied locally).
+pub fn long_window_for_kind(kind: LongWindowKind) -> [f32; 36] {
+    match kind {
+        LongWindowKind::Normal => long_window(),
+        LongWindowKind::Start => start_window(),
+        LongWindowKind::Stop => stop_window(),
+    }
 }
 
 /// Returns the 36-sample window for a given BlockType. Short blocks
@@ -240,8 +330,68 @@ fn imdct_12(spec: &[f32; 6]) -> [f32; 12] {
 }
 
 // ---------------------------------------------------------------------------
-// Anti-aliasing butterfly
+// Reorder for short blocks (ISO/IEC 11172-3 §2.4.3.4.9)
 // ---------------------------------------------------------------------------
+
+/// Reorder a 576-line spectrum for short blocks from natural subband-
+/// major/window-minor layout to the interleaved scalefactor-band layout
+/// the quantizer and Huffman coder expect.
+///
+/// # Layout
+///
+/// **Input (natural):** `spectrum[sb*18 + wi*6 + k]` = subband `sb`,
+/// window `wi` (0-2), spectral line `k` (0-5).
+///
+/// **Output (interleaved):** 12 scalefactor bands × 3 windows × width
+/// lines, laid out contiguously per band. This groups same-band data
+/// across all 3 windows, matching `build_band_map`'s short-block layout
+/// in `loop_control.rs`.
+///
+/// `sfb_boundaries` gives line boundaries *within one 192-line window*
+/// (not flat indices). The flat interleaved boundary for band `b` is
+/// `3 * sfb_boundaries[b]`.
+pub fn reorder_short(
+    spectrum: &[f32; 576],
+    sfb_boundaries: &[usize],
+    num_bands: usize,
+) -> [f32; 576] {
+    let mut out = [0.0f32; 576];
+
+    // For each scalefactor band: copy the band's spectral lines from
+    // all 3 windows contiguously into the output.
+    for band in 0..num_bands {
+        let band_start_line = sfb_boundaries[band]; // within one window
+        let band_end_line = sfb_boundaries[band + 1].min(192);
+        let band_width = band_end_line - band_start_line;
+
+        // Destination: flat interleaved position
+        let dst_start = 3 * band_start_line;
+
+        for wi in 0..3 {
+            let _win_offset = wi * 6; // window offset within subband
+            for line in 0..band_width {
+                let spectral_line = band_start_line + line; // within one window
+
+                // Find which subband this line belongs to.
+                // With 32 subbands, each subband contributes 6 lines per
+                // short window (32 × 6 = 192). A single subband contains
+                // lines: sb=0 has lines 0-5, sb=1 has 6-11, etc.
+                let sb = spectral_line / 6;
+                let line_in_sb = spectral_line % 6;
+
+                // Natural layout: subband-major, window-minor within subband
+                let src = sb * 18 + wi * 6 + line_in_sb;
+
+                // Interleaved layout: band-major, window-minor within band
+                let dst = dst_start + wi * band_width + line;
+
+                out[dst] = spectrum[src];
+            }
+        }
+    }
+
+    out
+}
 
 /// Cosine (`cs`) / sine (`ca`) rotation coefficients for the 8-point
 /// anti-aliasing butterfly (ISO/IEC 11172-3 §2.4.3.4.9.4).
@@ -631,5 +781,57 @@ mod tests {
         // effect) but energy is roughly conserved.
         let diff = (leakage_before - leakage_after).abs();
         assert!(diff > 1e-6, "butterfly should modify the spectrum");
+    }
+
+    // --- Reorder tests ---
+
+    #[test]
+    fn reorder_short_preserves_all_values() {
+        let mut spectrum = [0.0f32; 576];
+        for i in 0..576 {
+            spectrum[i] = i as f32;
+        }
+        let boundaries: Vec<usize> = (0..=12).map(|b| b * 16).collect();
+        let out = reorder_short(&spectrum, &boundaries, 12);
+
+        let mut seen = [false; 576];
+        for &v in &out {
+            let idx = v as usize;
+            assert!(idx < 576, "value {v} out of range");
+            assert!(!seen[idx], "value {idx} appears twice");
+            seen[idx] = true;
+        }
+        assert!(
+            seen.iter().all(|&s| s),
+            "not all values 0..575 were preserved"
+        );
+    }
+
+    #[test]
+    fn reorder_short_is_permutation() {
+        // The reorder must preserve all values — it's a permutation,
+        // not a transform that changes values.
+        let mut spectrum = [0.0f32; 576];
+        for i in 0..576 {
+            spectrum[i] = (i as f32 * 1.3).sin();
+        }
+        let boundaries: Vec<usize> = (0..=12).map(|b| b * 16).collect();
+        let out = reorder_short(&spectrum, &boundaries, 12);
+
+        let mut src_sorted: Vec<f32> = spectrum.to_vec();
+        src_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mut out_sorted: Vec<f32> = out.to_vec();
+        out_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        for (a, b) in src_sorted.iter().zip(out_sorted.iter()) {
+            assert!((a - b).abs() < 1e-6, "reorder must be a permutation");
+        }
+
+        // The layout must actually change
+        let diff: f32 = out
+            .iter()
+            .zip(spectrum.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        assert!(diff > 0.1, "reorder should change the layout");
     }
 }

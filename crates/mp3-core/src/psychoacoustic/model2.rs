@@ -702,4 +702,66 @@ mod tests {
             assert!(smr2.bands[i].is_finite());
         }
     }
+
+    #[test]
+    #[allow(clippy::needless_range_loop)]
+    fn lookahead_window_changes_smr_vs_zero_padding_on_transient() {
+        // Verifies that feeding the psychoacoustic model a 1024-sample
+        // window with real look-back context produces different SMR
+        // values than zero-padded windows on a signal with a sharp
+        // transient. Zero-padding introduces spectral leakage at the
+        // FFT discontinuity that distorts SMR — this test confirms the
+        // look-back window changes the model's output for the same
+        // granule samples.
+        let sample_rate = 44100u32;
+
+        // Signal: quiet → sudden loud tone (attack at sample 512)
+        let mut signal = vec![0.0f32; 1024];
+        for i in 0..512 {
+            signal[i] = 0.01 * sin(i as f32 * 0.5);
+        }
+        for i in 512..1024 {
+            signal[i] = 0.8 * sin((i as f32) * 1.2);
+        }
+
+        // Model with zero-padding: window[0..576] = granule, rest zeros
+        let mut model_zp = make_model(sample_rate);
+        for _ in 0..3 {
+            model_zp.analyze_granule(&[0.0; 1024], sample_rate);
+        }
+        let mut zp_window = [0.0f32; 1024];
+        zp_window[..576].copy_from_slice(&signal[..576]);
+        let (smr_zp, _) = model_zp.analyze_granule(&zp_window, sample_rate);
+
+        // Model with look-back: window[0..448] = prev.context, window[448..]=granule
+        let mut model_lb = make_model(sample_rate);
+        for _ in 0..3 {
+            model_lb.analyze_granule(&[0.0; 1024], sample_rate);
+        }
+        let mut lb_window = [0.0f32; 1024];
+        // Simulate 448-sample look-back from a previous frame (varied,
+        // not identical to zeros — use the end of the signal for realism)
+        lb_window[..448].copy_from_slice(&signal[576..1024]);
+        lb_window[448..].copy_from_slice(&signal[..576]);
+        let (smr_lb, _) = model_lb.analyze_granule(&lb_window, sample_rate);
+
+        // Count how many bands differ — a properly different window
+        // should produce a different SMR profile.
+        let mut diff_count = 0usize;
+        let mut max_rel_diff = 0.0f32;
+        for b in 0..22 {
+            let d = (smr_zp.bands[b] - smr_lb.bands[b]).abs();
+            let rel = d / smr_zp.bands[b].max(smr_lb.bands[b]).max(1.0);
+            if rel > 0.01 {
+                diff_count += 1;
+            }
+            max_rel_diff = max_rel_diff.max(rel);
+        }
+
+        assert!(
+            diff_count > 0 || max_rel_diff > 0.01,
+            "SMR with look-back and zero-padding should differ on transient \
+             (diff_count={diff_count}, max_rel_diff={max_rel_diff})"
+        );
+    }
 }
