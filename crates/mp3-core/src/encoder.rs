@@ -456,6 +456,18 @@ impl Encoder {
         // --- Phase 2: Code each analysis ---
         self.main_data_buf.clear();
 
+        // `main_data` is one continuous bit stream across every
+        // granule/channel in the frame, byte-aligned only at its very
+        // start (right after side info) -- not once per section. A
+        // single `BitWriter` kept open across the whole loop below (and
+        // flushed exactly once, after it) is what makes that hold;
+        // splicing each granule's already-encoded scratch buffers in via
+        // `write_raw_bits` (exact bit counts, no inter-section padding)
+        // rather than a byte-level `extend_from_slice` is the other half
+        // -- see `BitWriter::write_raw_bits`'s doc comment for the
+        // decoder desync a byte-copy here used to cause.
+        let mut main_data_writer = BitWriter::new(&mut self.main_data_buf);
+
         let mut gi_gr0_ch0 = default_granule_side_info();
         let mut gi_gr0_ch1 = gi_gr0_ch0;
         let mut gi_gr1_ch0 = gi_gr0_ch0;
@@ -480,10 +492,10 @@ impl Encoder {
                     quant_result,
                     scalefac_compress,
                     scalefac_bits,
-                    sf_len,
+                    _sf_len,
                     huffman_info,
                     huffman_bits,
-                    granule_len,
+                    _granule_len,
                 ) = Self::code_granule(
                     &mut self.sf_buf,
                     &mut self.granule_buf,
@@ -501,9 +513,14 @@ impl Encoder {
                     "granule/channel main_data overflow"
                 );
 
-                self.main_data_buf.extend_from_slice(&self.sf_buf[..sf_len]);
-                self.main_data_buf
-                    .extend_from_slice(&self.granule_buf[..granule_len]);
+                // Splice this granule/channel's scalefactors + Huffman
+                // data onto the frame's single continuous `main_data`
+                // bit stream, using their *exact* bit lengths (not the
+                // scratch buffers' flushed byte lengths, which
+                // `_sf_len`/`_granule_len` above measure) -- see
+                // `BitWriter::write_raw_bits`'s doc comment.
+                main_data_writer.write_raw_bits(&self.sf_buf, scalefac_bits as usize);
+                main_data_writer.write_raw_bits(&self.granule_buf, huffman_bits as usize);
 
                 let gi = if gr == 0 {
                     if ch == 0 {
@@ -524,6 +541,13 @@ impl Encoder {
                 gi.huffman = huffman_info;
             }
         }
+
+        // Byte-align exactly once, at the true end of this frame's
+        // `main_data` -- not per section (see `main_data_writer`'s doc
+        // comment above). With `main_data_begin` always 0 (no cross-frame
+        // reservoir borrowing yet), this frame's own main_data is
+        // self-contained, so aligning only here is correct.
+        main_data_writer.flush();
 
         // --- Reservoir bookkeeping ---
         let actual_bits_used = self.main_data_buf.len() as u32 * 8;
@@ -840,25 +864,34 @@ fn encode_granule_inner(
     sf_buf.clear();
     let (scalefac_compress, scalefac_bits) = {
         let mut sf_writer = BitWriter::new(sf_buf);
-        let r = encode_granule_scalefactors(
+        let (compress, _reported_bits) = encode_granule_scalefactors(
             &quant_result.scalefac.values,
             block_type,
             sample_rate_hz,
             &mut sf_writer,
         );
+        // Authoritative bit count: measured directly off the writer
+        // *before* `flush()` pads it to a byte boundary. `main_data`
+        // packs sections with no inter-section byte alignment (see
+        // `BitWriter::write_raw_bits`'s doc comment) — reporting the
+        // flush-rounded length here would both misdeclare
+        // `part2_3_length` and, if used to size the splice into
+        // `main_data_buf`, carry the padding bits into the bitstream
+        // as if they were real data.
+        let exact_bits = sf_writer.bit_len() as u32;
         sf_writer.flush();
-        r
+        (compress, exact_bits)
     };
     let sf_len = sf_buf.len();
 
     granule_buf.clear();
-    let huffman_info = {
+    let (huffman_info, huffman_bits) = {
         let mut writer = BitWriter::new(granule_buf);
         let info = encode_granule(&quant_result.ix, block_type, &mut writer);
+        let exact_bits = writer.bit_len() as u32;
         writer.flush();
-        info
+        (info, exact_bits)
     };
-    let huffman_bits = granule_buf.len() as u32 * 8;
     let granule_len = granule_buf.len();
 
     (
