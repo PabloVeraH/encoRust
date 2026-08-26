@@ -16,6 +16,7 @@ use crate::filterbank::PolyphaseFilterbank;
 use crate::frame::FrameHeader;
 use crate::huffman::encode_granule;
 use crate::io::PcmBuffer;
+use crate::mdct::antialias_butterfly;
 use crate::mdct::long_window;
 use crate::mdct::long_window_for_kind;
 use crate::mdct::reorder_short;
@@ -634,9 +635,11 @@ impl Encoder {
         subband_samples: &[[f32; 18]; SUBBANDS],
         block_type: BlockType,
     ) -> [f32; 576] {
-        let mut spectrum = [0.0f32; 576];
+        let mut mdct_out = [[0.0f32; 18]; SUBBANDS];
+        let mut block_types = [BlockType::Long; SUBBANDS];
 
         for sb in 0..SUBBANDS {
+            block_types[sb] = block_type;
             match block_type {
                 BlockType::Long | BlockType::Start | BlockType::Stop => {
                     let window = match block_type {
@@ -648,37 +651,9 @@ impl Encoder {
                     let (spec, new_tail) =
                         transform_long(&subband_samples[sb], &self.mdct_prev_tail[ch][sb], &window);
                     self.mdct_prev_tail[ch][sb] = new_tail;
-                    for k in 0..18 {
-                        spectrum[sb * 18 + k] = spec[k];
-                    }
+                    mdct_out[sb] = spec;
                 }
                 BlockType::Short => {
-                    // 3 short (12-sample, 50%-overlap) windows, built
-                    // entirely from this granule's 18 new subband samples
-                    // plus a 6-sample tail from the previous granule — no
-                    // look-ahead needed. Concatenating tail(6) + new(18)
-                    // gives a 24-sample virtual timeline; three 12-sample
-                    // windows hopping by 6 (starting at the tail's first
-                    // sample) exactly tile it:
-                    //   window0 = timeline[ 0..12) = tail(6)   | new[0..6)
-                    //   window1 = timeline[ 6..18) = new[0..6) | new[6..12)
-                    //   window2 = timeline[12..24) = new[6..12)| new[12..18)
-                    // and new[12..18) (what's left over) becomes the tail
-                    // for the *next* granule's window0 — the same
-                    // "store the 18 new samples as tail" convention
-                    // `transform_long` already uses, so a following Short
-                    // granule's window0 reads `tail[12..18]` correctly
-                    // regardless of whether the previous granule was Long
-                    // or Short, and a following Stop granule's
-                    // `transform_long` gets a complete (not partially-
-                    // stale) 18-sample history instead of only 6 real
-                    // samples plus 12 leftover ones. An earlier version of
-                    // this branch built window1/window2 from the wrong
-                    // sample ranges (no overlap between window0/window1 at
-                    // all) and wrote only 6 of the tail's 18 slots on
-                    // update while reading a different 6-slot range next
-                    // time, corrupting every Short→Short and Short→Stop
-                    // transition. See `docs/plus.md` M11.4.
                     let tail = self.mdct_prev_tail[ch][sb];
                     let new = subband_samples[sb];
                     let mut windows = [[0.0f32; 12]; 3];
@@ -692,11 +667,22 @@ impl Encoder {
                     let spec_blocks = transform_short(&windows);
                     for wi in 0..3 {
                         for k in 0..6 {
-                            spectrum[sb * 18 + wi * 6 + k] = spec_blocks[wi][k];
+                            mdct_out[sb][wi * 6 + k] = spec_blocks[wi][k];
                         }
                     }
                     self.mdct_prev_tail[ch][sb] = new;
                 }
+            }
+        }
+
+        // Anti-aliasing butterfly across adjacent subbands (ISO §2.4.3.4.9.4)
+        antialias_butterfly(&mut mdct_out, &block_types);
+
+        // Flatten to 576-line layout
+        let mut spectrum = [0.0f32; 576];
+        for sb in 0..SUBBANDS {
+            for k in 0..18 {
+                spectrum[sb * 18 + k] = mdct_out[sb][k];
             }
         }
 
