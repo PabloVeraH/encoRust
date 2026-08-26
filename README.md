@@ -95,6 +95,30 @@ CI (`.github/workflows/ci.yml`) runs all of the above plus a
 
 MSRV: 1.82 (see `rust-toolchain.toml`).
 
+### Rebuilding after a code change
+
+`cargo build`/`cargo test` only recompile the library and test binaries —
+if you're invoking `target/release/encorust` directly (by path, as in the
+examples below), it stays stale until you rebuild the CLI explicitly:
+
+```bash
+cargo build --release -p mp3-cli   # binary lands at target/release/encorust
+./target/release/encorust -o output.mp3 -b 192 input.wav
+```
+
+To sanity-check the result (waveform, spectrogram, peak/RMS levels)
+against the original, use `ffmpeg`:
+
+```bash
+ffmpeg -i input.wav -af "astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.Peak_level" -f null -
+ffmpeg -i output.mp3 -af "astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.Peak_level" -f null -
+```
+
+Decoding with `ffmpeg` (or any standards-compliant decoder, not this
+project's own encoder logic) is important when debugging encoder bugs —
+it's the only way to tell whether output that sounds wrong is a real
+bitstream problem versus something specific to one decoder.
+
 ## Status
 
 | Feature | Status |
