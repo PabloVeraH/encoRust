@@ -22,9 +22,6 @@ use libm::{fabsf, powf};
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Maximum inner-loop (rate) iterations before accepting best-effort.
-const MAX_INNER_ITERATIONS: usize = 64;
-
 /// Maximum outer-loop (distortion) iterations before accepting best-effort.
 const MAX_OUTER_ITERATIONS: usize = 8;
 
@@ -50,6 +47,24 @@ const MAX_SCALEFAC: u8 = 15;
 
 /// Small floor to prevent log-of-zero / div-by-zero in edge cases.
 const EPS: f32 = 1e-30;
+
+/// Largest `ix` magnitude any Huffman big_values table can represent.
+/// The widest table (`xlen=16`, i.e. `esc_threshold=15`) paired with the
+/// widest escape (`linbits=13`) covers `15 + (2^13 - 1) = 8206` — see
+/// `huffman::tables::BIG_VALUES_TABLES`. `quantize_spectrum` saturates to
+/// this bound for the same reason `scalefactor_encode::saturate_to_width`
+/// clamps scalefactors: producing a value no real Huffman table (with or
+/// without its escape mechanism) can encode doesn't fail loudly here --
+/// `encode_granule`'s `write_bits` calls would silently truncate the
+/// escape field's high bits instead, corrupting that value and
+/// desyncing every bit the decoder reads afterward in the granule. This
+/// was unreachable while the rate loop only ever searched `step` upward
+/// from a fixed 0 (small, bounded `ix`); it became reachable once the
+/// search was corrected to cover the *entire* representable `step`
+/// range (see `inner_loop`'s doc comment) — confirmed via symphonia
+/// reporting `"huffman decode overrun"` on real content before this
+/// clamp was added.
+const MAX_REPRESENTABLE_IX: i32 = 8206;
 
 // ---------------------------------------------------------------------------
 // Quantization result
@@ -108,7 +123,7 @@ fn quantize_spectrum(
         let scaled = fabsf(spectrum[i]) * powf(2.0, -STEP_SCALE * step_eff);
         let ix_float = powf(scaled, QUANT_POW_ENCODE) - QUANT_OFFSET;
         ix_out[i] = if ix_float > 0.0 {
-            (ix_float + 0.5) as i32
+            ((ix_float + 0.5) as i32).min(MAX_REPRESENTABLE_IX)
         } else {
             0
         };
@@ -176,21 +191,22 @@ fn dequantize_spectrum(
 // ---------------------------------------------------------------------------
 // Bit-count estimator (§3 inner loop)
 // ---------------------------------------------------------------------------
-
-/// Cheap, monotonic estimate of the Huffman-coded bit count.
-/// Each nonzero value v costs `1 (sign) + floor(log2(v)) + 1 (Huffman)`
-/// bits. Zero = 0 bits. Monotonic in both v and step.
-fn estimate_bits(ix: &[i32; 576]) -> u32 {
-    let mut bits: u32 = 0;
-    for &v in ix.iter() {
-        if v > 0 {
-            bits += 1; // sign bit
-                       // floor(log2(v)): count bits needed for magnitude
-            bits += 32u32 - v.leading_zeros(); // magnitude bits — floor(log2(v))+1
-        }
-    }
-    bits
-}
+//
+// The rate loop below costs candidate quantizations via
+// `crate::huffman::estimate_bits` -- the *real*, per-region Huffman table
+// cost (see that function's doc comment), not an independent, cheaper
+// heuristic. An earlier version of this module had its own such
+// heuristic here (`1 (sign) + floor(log2(v)) + 1` bits per nonzero
+// value, monotonic in `v` and `step` but otherwise unrelated to what any
+// real Huffman table actually costs). That was tolerable while the rate
+// loop only ever searched a narrow, small-`ix` region of `step`, but
+// became a real bug once the search was corrected to cover the entire
+// representable `step` range (see `inner_loop`'s doc comment): the crude
+// estimate could under-count badly enough that a chosen step's *real*
+// Huffman-coded size overflowed the granule's bit budget, silently
+// truncating `main_data` for the rest of the frame — confirmed via an
+// independent decoder (symphonia) reporting "huffman decode overrun" on
+// real content before this switch.
 
 // ---------------------------------------------------------------------------
 // Per-band helpers
@@ -309,71 +325,101 @@ struct InnerLoopResult {
     converged: bool,
 }
 
-/// Rate loop: increase step (→ coarser quantization) until estimated bits
-/// fit in `bit_budget`, or max iterations reached.
+/// Smallest representable `step` (`global_gain` field = 0).
+const MIN_STEP: i32 = -(GLOBAL_GAIN_BIAS as i32);
+
+/// Largest representable `step` (`global_gain` field = `MAX_GLOBAL_GAIN`).
+const MAX_STEP: i32 = MAX_GLOBAL_GAIN as i32 - GLOBAL_GAIN_BIAS as i32;
+
+/// Rate loop: binary-search `step` over the *entire* representable range
+/// (`global_gain` 0..=255, i.e. `step` in `MIN_STEP..=MAX_STEP`) for the
+/// finest (smallest) step whose estimated bit count still fits
+/// `bit_budget`.
+///
+/// `quantize_spectrum`'s bit cost is monotonically non-increasing in
+/// `step` (a coarser step never needs *more* bits to represent the same
+/// spectrum — see `quantizer_values_monotonic_with_step`/
+/// `estimate_bits_monotonic`), which is exactly the precondition a
+/// binary search over a monotonic predicate needs: converges to the
+/// optimal boundary in `O(log(MAX_STEP - MIN_STEP))` ≈ 8 evaluations,
+/// regardless of the spectrum's absolute magnitude.
+///
+/// An earlier version searched *linearly upward from `step = 0`* only
+/// (never finer, i.e. never negative) — implicitly assuming `spectrum`'s
+/// magnitudes already sit in whatever range makes `step = 0` a
+/// reasonable starting point. That assumption silently broke for this
+/// encoder's own PCM convention: `io::PcmBuffer` normalizes samples to
+/// `[-1.0, 1.0]` (not the raw 16-bit-integer range many quantizer
+/// constants are implicitly calibrated against), so real spectra are
+/// often small enough that `step = 0` already quantizes everything to
+/// zero — and since the loop could only ever coarsen from there, no
+/// amount of iteration would recover a nonzero result; only per-band
+/// scalefactor amplification could (`quantize_granule`'s outer loop),
+/// and its own iteration cap isn't remotely enough to cover the gap.
+/// Searching the *full* valid range removes the need to guess a correct
+/// starting point at all. See `docs/mejoras.md`'s gain-bug investigation
+/// notes for how this was diagnosed (empirically, via ffmpeg/symphonia
+/// differential decoding against real recordings, not just this crate's
+/// own self-consistent quantize/dequantize round-trip).
 fn inner_loop(
     spectrum: &[f32; 576],
     bit_budget: u32,
     band_of_line: &[usize; 576],
     scalefac: &[u8; 39],
     scalefac_scale: bool,
-    step_start: f32,
+    block_type: BlockType,
 ) -> InnerLoopResult {
-    let mut step = step_start;
     let mut ix = [0i32; 576];
     let mut sign = [false; 576];
 
-    for _ in 0..MAX_INNER_ITERATIONS {
+    let quantize_at = |step: i32, ix: &mut [i32; 576], sign: &mut [bool; 576]| {
         quantize_spectrum(
             spectrum,
-            step,
+            step as f32,
             band_of_line,
             scalefac,
             scalefac_scale,
-            &mut ix,
-            &mut sign,
+            ix,
+            sign,
         );
-        let bits = estimate_bits(&ix);
-        if bits <= bit_budget {
-            let gg = (step as i32 + GLOBAL_GAIN_BIAS as i32).clamp(0, MAX_GLOBAL_GAIN as i32) as u8;
-            return InnerLoopResult {
-                ix,
-                sign,
-                step,
-                global_gain: gg,
-                converged: true,
-            };
-        }
-        step += 1.0;
-        if step > (MAX_GLOBAL_GAIN - GLOBAL_GAIN_BIAS) as f32 {
-            break;
+        crate::huffman::estimate_bits(ix, block_type)
+    };
+
+    // If even the coarsest representable step doesn't fit, there is
+    // nothing more coarsening can do -- return that best-effort result
+    // and report non-convergence (mirrors the previous implementation's
+    // step-cap fallback).
+    if quantize_at(MAX_STEP, &mut ix, &mut sign) > bit_budget {
+        return InnerLoopResult {
+            ix,
+            sign,
+            step: MAX_STEP as f32,
+            global_gain: MAX_GLOBAL_GAIN,
+            converged: false,
+        };
+    }
+
+    // Binary search: `hi` always denotes a step known to fit (`MAX_STEP`
+    // does, per the check above); narrow until `lo == hi`.
+    let mut lo = MIN_STEP;
+    let mut hi = MAX_STEP;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if quantize_at(mid, &mut ix, &mut sign) <= bit_budget {
+            hi = mid;
+        } else {
+            lo = mid + 1;
         }
     }
 
-    // Clamp the step actually used for the final requantize to the max
-    // representable `global_gain` -- otherwise, when the loop above exits
-    // via the step-cap break, `step` has already been incremented one
-    // past that cap, and the `ix` values below would be computed at a
-    // step the returned (clamped) `global_gain` doesn't represent: a real
-    // decoder given that `global_gain` would reconstruct a *finer*
-    // quantization than the encoder actually applied.
-    let final_step = step.min((MAX_GLOBAL_GAIN - GLOBAL_GAIN_BIAS) as f32);
-    let gg = (final_step as i32 + GLOBAL_GAIN_BIAS as i32).clamp(0, MAX_GLOBAL_GAIN as i32) as u8;
-    quantize_spectrum(
-        spectrum,
-        final_step,
-        band_of_line,
-        scalefac,
-        scalefac_scale,
-        &mut ix,
-        &mut sign,
-    );
+    quantize_at(hi, &mut ix, &mut sign);
+    let gg = (hi + GLOBAL_GAIN_BIAS as i32).clamp(0, MAX_GLOBAL_GAIN as i32) as u8;
     InnerLoopResult {
         ix,
         sign,
-        step: final_step,
+        step: hi as f32,
         global_gain: gg,
-        converged: false,
+        converged: true,
     }
 }
 
@@ -417,7 +463,7 @@ pub fn quantize_granule(
             &band_of_line,
             &scalefac,
             scalefac_scale,
-            0.0,
+            block_type,
         );
         let inner_step = ir.step;
 
@@ -645,7 +691,7 @@ mod tests {
                 &mut ix,
                 &mut sign,
             );
-            let bits = estimate_bits(&ix);
+            let bits = crate::huffman::estimate_bits(&ix, BlockType::Long);
             assert!(
                 bits <= prev_bits,
                 "bits {bits} > prev {prev_bits} at step {step} — estimator not monotonic"
@@ -655,6 +701,49 @@ mod tests {
     }
 
     // --- Inner loop convergence ---
+    //
+    // The rate loop binary-searches the *entire* representable `step`
+    // range (see `inner_loop`'s doc comment for why an earlier version's
+    // "linear scan upward from step=0 only" search was itself a bug, not
+    // just an optimization opportunity) for the finest step that still
+    // fits the bit budget. `assert_optimal_step` checks the actual
+    // invariant that guarantees: the returned step fits, and the next
+    // *finer* step (one less) does not — i.e. this is genuinely the
+    // boundary the search claims to have found, not merely "some step
+    // that happens to fit".
+    fn assert_optimal_step(
+        spectrum: &[f32; 576],
+        band_map: &[usize; 576],
+        scalefac: &[u8; 39],
+        bit_budget: u32,
+        step: f32,
+    ) {
+        let mut ix = [0i32; 576];
+        let mut sign = [false; 576];
+        quantize_spectrum(
+            spectrum, step, band_map, scalefac, false, &mut ix, &mut sign,
+        );
+        assert!(
+            crate::huffman::estimate_bits(&ix, BlockType::Long) <= bit_budget,
+            "returned step {step} does not actually fit budget {bit_budget}"
+        );
+        if step as i32 > MIN_STEP {
+            quantize_spectrum(
+                spectrum,
+                step - 1.0,
+                band_map,
+                scalefac,
+                false,
+                &mut ix,
+                &mut sign,
+            );
+            assert!(
+                crate::huffman::estimate_bits(&ix, BlockType::Long) > bit_budget,
+                "step {step} isn't optimal -- {} (one finer) also fits budget {bit_budget}",
+                step - 1.0
+            );
+        }
+    }
 
     #[test]
     fn inner_loop_converges_under_generous_budget() {
@@ -662,13 +751,16 @@ mod tests {
         let band_map = make_band_map_44100();
         let scalefac = [0u8; 39];
 
-        let result = inner_loop(&spectrum, 10_000, &band_map, &scalefac, false, 0.0);
-        assert!(result.converged, "should converge with generous budget");
-        assert!(
-            result.step < 10.0,
-            "should need little coarsening, step={}",
-            result.step
+        let result = inner_loop(
+            &spectrum,
+            10_000,
+            &band_map,
+            &scalefac,
+            false,
+            BlockType::Long,
         );
+        assert!(result.converged, "should converge with generous budget");
+        assert_optimal_step(&spectrum, &band_map, &scalefac, 10_000, result.step);
     }
 
     #[test]
@@ -677,32 +769,48 @@ mod tests {
         let band_map = make_band_map_44100();
         let scalefac = [0u8; 39];
 
-        let result = inner_loop(&spectrum, 100, &band_map, &scalefac, false, 0.0);
-        let bits = estimate_bits(&result.ix);
+        let result = inner_loop(&spectrum, 100, &band_map, &scalefac, false, BlockType::Long);
+        let bits = crate::huffman::estimate_bits(&result.ix, BlockType::Long);
         assert!(
-            bits <= 300,
-            "tight budget (100) should force coarsening; got {bits} bits"
+            bits <= 100,
+            "tight budget (100) should be honored exactly; got {bits} bits"
         );
+        assert_optimal_step(&spectrum, &band_map, &scalefac, 100, result.step);
     }
 
     #[test]
-    fn inner_loop_terminates_at_max_step() {
-        let spectrum = make_tone_spectrum(10, 1.0);
+    fn inner_loop_finds_exact_optimal_step_for_small_signal() {
+        // A single small-magnitude line -- exactly the case an earlier,
+        // "only ever coarsen from step=0" version of this loop handled
+        // by silently quantizing to zero forever (see `inner_loop`'s doc
+        // comment): a full-range search must still find *some* nonzero,
+        // budget-fitting representation for it, including steps well
+        // below zero.
+        let spectrum = make_tone_spectrum(10, 0.001);
         let band_map = make_band_map_44100();
         let scalefac = [0u8; 39];
 
-        let result = inner_loop(&spectrum, 1, &band_map, &scalefac, false, 120.0);
-        assert!(
-            result.step >= 44.0,
-            "should reach near max step, got {}",
-            result.step
+        let result = inner_loop(
+            &spectrum,
+            10_000,
+            &band_map,
+            &scalefac,
+            false,
+            BlockType::Long,
         );
+        assert!(result.converged);
+        assert!(
+            result.ix[10] > 0,
+            "a generous budget must recover a nonzero representation for a small \
+             but real signal, not silently settle for all-zero"
+        );
+        assert_optimal_step(&spectrum, &band_map, &scalefac, 10_000, result.step);
     }
 
     #[test]
     fn zero_spectrum_costs_zero_bits() {
         let ix = [0i32; 576];
-        assert_eq!(estimate_bits(&ix), 0);
+        assert_eq!(crate::huffman::estimate_bits(&ix, BlockType::Long), 0);
     }
 
     // --- Outer loop: scalefactor amplification ---
@@ -773,7 +881,7 @@ mod tests {
         for &v in &result.ix {
             assert!(v >= 0, "ix values must be non-negative");
         }
-        let bits = estimate_bits(&result.ix);
+        let bits = crate::huffman::estimate_bits(&result.ix, BlockType::Long);
         assert!(bits < 20_000, "bit count {bits} should be bounded");
     }
 
@@ -791,7 +899,7 @@ mod tests {
         let band_map = make_band_map_44100();
         let scalefac = [0u8; 39];
 
-        let result = inner_loop(&spectrum, 0, &band_map, &scalefac, false, 0.0);
+        let result = inner_loop(&spectrum, 0, &band_map, &scalefac, false, BlockType::Long);
         assert!(
             !result.converged,
             "a magnitude the step cap can't tame should report non-convergence"

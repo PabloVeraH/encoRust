@@ -201,15 +201,14 @@ fn count1_region_cost(ix: &[i32], start: usize, end: usize) -> (bool, u32) {
 
 /// The `big_values`/`count1`/`rzero` region boundaries for one granule,
 /// per chapter 09 §1. Shared by [`estimate_bits`] and [`encode_granule`]
-/// so the estimator actually costs the same regions the real encoder
-/// commits to -- an earlier version had `estimate_bits` cost the entire
-/// granule as one undifferentiated run of pairs, which doesn't resemble
-/// what gets emitted closely enough to be a tight estimate.
+/// (via [`RegionSplit::compute`], which takes `big_values_end` from
+/// here) so both cost/encode the same regions the real encoder commits
+/// to -- an earlier version had `estimate_bits` cost the entire granule
+/// as one undifferentiated run of pairs, which doesn't resemble what
+/// gets emitted closely enough to be a tight estimate.
 struct Regions {
     big_values_end: usize,
     count1_end: usize,
-    r0_end: usize,
-    r1_end: usize,
 }
 
 fn compute_regions(ix: &[i32; SAMPLES_PER_GRANULE]) -> Regions {
@@ -237,39 +236,46 @@ fn compute_regions(ix: &[i32; SAMPLES_PER_GRANULE]) -> Regions {
     // proptest-regressions/huffman/encode.txt).
     count1_end = count1_end.max(big_values_end);
 
-    let pairs_count = big_values_end / 2;
-    let third = pairs_count / 3;
-
     Regions {
         big_values_end,
         count1_end,
-        r0_end: third * 2,
-        r1_end: third * 4,
     }
 }
 
-/// Bit-count estimate for the quantization inner loop
+/// Bit-count estimate for the quantization rate loop
 /// ([`crate::quantize::loop_control::quantize_granule`]). Must
-/// over-estimate rather than under-estimate on ties, so the inner loop
-/// never produces a bitstream that overflows its budget once
-/// [`encode_granule`] runs for real -- this mirrors `encode_granule`'s
-/// actual region splitting and per-region table costing exactly (see
-/// `region_cost_with_table`'s doc comment for why a cheaper, per-pair
-/// heuristic silently violated that contract). See
-/// `docs/mp3-encoder/09-phase6-huffman-coding.md` §4.
+/// over-estimate rather than under-estimate on ties, so that loop never
+/// settles on a step whose real, Huffman-coded size overflows the
+/// granule's bit budget once [`encode_granule`] runs for real -- an
+/// undercount here doesn't fail loudly: `encode_granule` still emits
+/// *some* bitstream, but a larger one than the rate loop budgeted for,
+/// which can overflow the frame's fixed `main_data` capacity and
+/// silently truncate later granules/channels in that frame (observed as
+/// an independent decoder's "huffman decode overrun" on real content,
+/// not this crate's own tests, since nothing here decodes its own
+/// output the way an external decoder does).
+///
+/// Costs the *exact same* regions [`encode_granule`] commits to --
+/// [`RegionSplit::compute`], not an independently-derived split -- for
+/// both `block_type` cases (see [`region_cost_with_table`]'s doc comment
+/// for why a cheaper, per-pair heuristic silently violated the
+/// over-estimate contract for the region split, and [`RegionSplit`]'s
+/// own doc comment for the equivalent bug this fixes in the boundary
+/// computation itself). See `docs/mp3-encoder/09-phase6-huffman-coding.md` §4.
 #[must_use]
-pub fn estimate_bits(ix: &[i32; SAMPLES_PER_GRANULE]) -> u32 {
+pub fn estimate_bits(ix: &[i32; SAMPLES_PER_GRANULE], block_type: BlockType) -> u32 {
+    let band_end = sf_band_end();
     let regions = compute_regions(ix);
+    let big_values_end = regions.big_values_end;
+    let count1_end = regions.count1_end;
+
+    let split = RegionSplit::compute(block_type, big_values_end, &band_end);
 
     let mut bits = 0u32;
-    for &(start, end) in &[
-        (0, regions.r0_end),
-        (regions.r0_end, regions.r1_end),
-        (regions.r1_end, regions.big_values_end),
-    ] {
+    for &(start, end) in &split.ranges[..split.n_regions] {
         bits += choose_table_and_cost(ix, start, end).1;
     }
-    bits += count1_region_cost(ix, regions.big_values_end, regions.count1_end).1;
+    bits += count1_region_cost(ix, big_values_end, count1_end).1;
 
     bits
 }
@@ -620,7 +626,7 @@ mod tests {
     const FLUSH_PADDING_SLOP_BITS: u32 = 7;
 
     fn assert_estimate_never_undercounts(ix: &[i32; SAMPLES_PER_GRANULE]) {
-        let estimate = estimate_bits(ix);
+        let estimate = estimate_bits(ix, BlockType::Long);
 
         let mut out = Vec::new();
         let mut writer = BitWriter::new(&mut out);
@@ -685,7 +691,7 @@ mod tests {
             seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
             *v = ((seed >> 24) as i32 - 128) / 4;
         }
-        let estimate = estimate_bits(&ix);
+        let estimate = estimate_bits(&ix, BlockType::Long);
         let mut out = Vec::new();
         let mut writer = BitWriter::new(&mut out);
         encode_granule(&ix, BlockType::Long, &mut writer);
@@ -836,13 +842,6 @@ mod tests {
 
         let pairs_count = info.big_values as usize;
         let big_values_end = pairs_count * 2;
-        let third = pairs_count / 3;
-        let regions = Regions {
-            big_values_end,
-            count1_end,
-            r0_end: third * 2,
-            r1_end: third * 4,
-        };
         let band_end = sf_band_end();
         let split = RegionSplit::compute(block_type, big_values_end, &band_end);
         let mut region_bounds = [(0usize, 0usize, 0u8); 3];
