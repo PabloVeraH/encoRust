@@ -321,20 +321,63 @@ impl RegionSplit {
     fn compute(
         block_type: BlockType,
         big_values_end: usize,
-        regions: &Regions,
         band_end: &[usize; SF_BAND_COUNT],
     ) -> Self {
         let pairs_count = big_values_end / 2;
         if block_type == BlockType::Long {
+            // ISO/IEC 11172-3: `region0_count` is (bands in region0) - 1;
+            // `region1_count` is (bands in region1) - 1 -- region1's own
+            // count, *not* cumulative from the start. A decoder derives
+            // both sample-line boundaries purely from these two fields:
+            // `region0_end = band_index[region0_count + 1]` and
+            // `region1_end = band_index[region0_count + 1 + region1_count + 1]`
+            // (verified against an external reference during the M11
+            // gain/corruption investigation -- see docs/mejoras.md).
+            //
+            // An earlier version computed `region0_count`/`region1_count`
+            // this way but then wrote the *actual* big_values bytes using
+            // `regions.r0_end`/`r1_end` -- independently-computed "raw
+            // thirds of pairs" boundaries from `compute_regions`, not
+            // required to land on the same scalefactor-band boundary at
+            // all. It also stored `region1_count` as the *cumulative*
+            // band count through region1's end rather than region1's own
+            // count. Both mistakes are silent: nothing here panics or
+            // fails a self-consistency check, since this encoder never
+            // decodes its own bitstream the way a real MP3 decoder does
+            // (region-boundary derivation from side info, independent of
+            // whatever the encoder privately used to choose those
+            // numbers). A real decoder applies `table_select[0]`/`[1]`
+            // over the *declared* boundaries, so any mismatch between
+            // "where this encoder actually switched Huffman tables" and
+            // "where the declared region0_count/region1_count say it
+            // did" corrupts every bit after the first such mismatch in
+            // the granule -- observed as ffmpeg's mp3float `overread`
+            // errors and garbage-looking (often full-scale) decoded
+            // audio on real content (a single dominant spectral line, as
+            // in a synthetic sine-tone test, rarely spans enough bands
+            // to expose it).
             let third = pairs_count / 3;
-            let region0_count = count_sf_bands_for_pairs(third, band_end) as u8;
-            let region1_count = count_sf_bands_for_pairs(third * 2, band_end) as u8;
+            let bands_through_r0 = count_sf_bands_for_pairs(third, band_end);
+            let bands_through_r1 =
+                count_sf_bands_for_pairs(third * 2, band_end).max(bands_through_r0);
+
+            let region0_count = bands_through_r0.saturating_sub(1).min(15) as u8;
+            let region1_bands = bands_through_r1 - bands_through_r0;
+            let region1_count = region1_bands.saturating_sub(1).min(7) as u8;
+
+            // The actual table-switch points, derived from the *same*
+            // region0_count/region1_count values just declared -- not
+            // from an independent calculation -- so the bytes this
+            // function writes below are guaranteed to match what any
+            // compliant decoder resolves from side info.
+            let r0_end =
+                band_end[(region0_count as usize).min(SF_BAND_COUNT - 1)].min(big_values_end);
+            let r1_end = band_end
+                [(region0_count as usize + region1_count as usize + 1).min(SF_BAND_COUNT - 1)]
+            .min(big_values_end);
+
             Self {
-                ranges: [
-                    (0, regions.r0_end),
-                    (regions.r0_end, regions.r1_end),
-                    (regions.r1_end, big_values_end),
-                ],
+                ranges: [(0, r0_end), (r0_end, r1_end), (r1_end, big_values_end)],
                 n_regions: 3,
                 region0_count,
                 region1_count,
@@ -410,7 +453,7 @@ pub fn encode_granule(
     // *both* table selection and the actual byte-encoding loop below —
     // see `RegionSplit`'s doc comment for why that used to be three
     // independently-computed (and disagreeing) values.
-    let split = RegionSplit::compute(block_type, big_values_end, &regions, &band_end);
+    let split = RegionSplit::compute(block_type, big_values_end, &band_end);
     let region0_count = split.region0_count;
     let region1_count = split.region1_count;
 
@@ -801,7 +844,7 @@ mod tests {
             r1_end: third * 4,
         };
         let band_end = sf_band_end();
-        let split = RegionSplit::compute(block_type, big_values_end, &regions, &band_end);
+        let split = RegionSplit::compute(block_type, big_values_end, &band_end);
         let mut region_bounds = [(0usize, 0usize, 0u8); 3];
         for (i, &(s, e)) in split.ranges.iter().enumerate().take(split.n_regions) {
             region_bounds[i] = (s, e, info.table_select[i]);
