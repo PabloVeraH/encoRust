@@ -225,8 +225,35 @@ pub fn window_for_type(bt: BlockType) -> [f32; 36] {
 
 /// Forward MDCT for a 36-sample long/start/stop windowed input → 18 lines.
 ///
-/// `X[k] = Σ_{n=0}^{35} z[n] * cos(π/36 * (n + 9.5) * (2k+1))`
+/// `X[k] = (2/18) * Σ_{n=0}^{35} z[n] * cos(π/36 * (n + 9.5) * (2k+1))`
+///
+/// The `2/N` (N=18) factor is required because a standards-compliant
+/// decoder's IMDCT applies **no** normalization of its own — verified
+/// directly against a working, independent decoder implementation
+/// (FlorisCreyf/mp3-decoder's `imdct()`: a raw cosine sum, no `2/N` or
+/// any other multiplier, before windowing). The forward and inverse
+/// cosine kernels used here form an (unnormalized) DCT-IV-like pair, for
+/// which applying the raw kernel on *both* sides compounds to a gain of
+/// `N/2` (a standard property of that transform, not specific to MP3) —
+/// so encoding without this factor and decoding with a real, compliant
+/// decoder reconstructs audio `N/2` (9x, +19 dB for long blocks) too
+/// loud, on top of whatever the psychoacoustic model and quantizer
+/// separately get right.
+///
+/// This alone isn't sufficient: pairing it with the quantizer's rate
+/// loop as it stood (searching `step` only upward from a fixed 0 —
+/// implicitly assuming `spectrum` magnitudes already fit that baseline)
+/// made real content collapse to complete silence instead, since this
+/// factor shrinks `spectrum`'s magnitudes and nothing else compensated.
+/// Fixed together with `quantize::loop_control::inner_loop` searching
+/// the *entire* representable `step` range instead — see that function's
+/// doc comment. Diagnosed empirically via ffmpeg/symphonia differential
+/// decoding against real recordings (this crate's own quantize/
+/// dequantize round-trip is self-consistent regardless of this factor,
+/// which is exactly why testing only against this encoder's own logic
+/// hid it) — see `docs/mejoras.md`'s gain-bug investigation notes.
 pub fn mdct_36(z: &[f32; 36]) -> [f32; 18] {
+    const SCALE: f32 = 2.0 / 18.0;
     let mut out = [0.0f32; 18];
     for (k, item) in out.iter_mut().enumerate() {
         let omega = PI / 36.0 * (2.0 * k as f32 + 1.0);
@@ -234,15 +261,19 @@ pub fn mdct_36(z: &[f32; 36]) -> [f32; 18] {
         for (n, &zn) in z.iter().enumerate() {
             sum += zn * cos((n as f32 + 9.5) * omega);
         }
-        *item = sum;
+        *item = sum * SCALE;
     }
     out
 }
 
 /// Forward MDCT for a 12-sample short-windowed input → 6 lines.
 ///
-/// `X[k] = Σ_{n=0}^{11} z[n] * cos(π/12 * (n + 3.5) * (2k+1))`
+/// `X[k] = (2/6) * Σ_{n=0}^{11} z[n] * cos(π/12 * (n + 3.5) * (2k+1))`
+///
+/// See [`mdct_36`]'s doc comment for why this `2/N` (N=6) factor is
+/// required to match a compliant decoder's unnormalized IMDCT.
 pub fn mdct_12(z: &[f32; 12]) -> [f32; 6] {
+    const SCALE: f32 = 2.0 / 6.0;
     let mut out = [0.0f32; 6];
     for (k, item) in out.iter_mut().enumerate() {
         let omega = PI / 12.0 * (2.0 * k as f32 + 1.0);
@@ -250,7 +281,7 @@ pub fn mdct_12(z: &[f32; 12]) -> [f32; 6] {
         for (n, &zn) in z.iter().enumerate() {
             sum += zn * cos((n as f32 + 3.5) * omega);
         }
-        *item = sum;
+        *item = sum * SCALE;
     }
     out
 }
@@ -298,33 +329,42 @@ pub fn transform_short(windows: &[[f32; 12]; 3]) -> [[f32; 6]; 3] {
 
 /// Inverse MDCT for a long block (N=18). Returns 36 time-domain samples.
 /// The caller must overlap-add with the previous block's second half.
+///
+/// Deliberately **unnormalized** — matching a real, standards-compliant
+/// decoder's IMDCT (verified against an independent, working
+/// implementation; see [`mdct_36`]'s doc comment), not the `2/N` this
+/// function used to apply. `mdct_36` now carries that `2/N` factor on
+/// the forward side instead, so this stays a faithful stand-in for an
+/// external decoder in the perfect-reconstruction test below — an
+/// earlier version of this function reapplied `2/N` here too, which
+/// would have canceled `mdct_36`'s new factor and hidden the very bug
+/// it exists to catch.
 #[cfg(test)]
 fn imdct_36(spec: &[f32; 18]) -> [f32; 36] {
     let mut out = [0.0f32; 36];
-    let scale = 2.0 / 18.0;
     for (n, out_n) in out.iter_mut().enumerate() {
         let omega = PI / 36.0 * (n as f32 + 9.5);
         let mut sum = 0.0;
         for (k, &spec_k) in spec.iter().enumerate() {
             sum += spec_k * cos((2.0 * k as f32 + 1.0) * omega);
         }
-        *out_n = sum * scale;
+        *out_n = sum;
     }
     out
 }
 
 /// Inverse MDCT for a short block (N=6), returning 12 samples.
+/// See [`imdct_36`]'s doc comment: deliberately unnormalized.
 #[cfg(test)]
 fn imdct_12(spec: &[f32; 6]) -> [f32; 12] {
     let mut out = [0.0f32; 12];
-    let scale = 2.0 / 6.0;
     for (n, out_n) in out.iter_mut().enumerate() {
         let omega = PI / 12.0 * (n as f32 + 3.5);
         let mut sum = 0.0;
         for (k, &spec_k) in spec.iter().enumerate() {
             sum += spec_k * cos((2.0 * k as f32 + 1.0) * omega);
         }
-        *out_n = sum * scale;
+        *out_n = sum;
     }
     out
 }
