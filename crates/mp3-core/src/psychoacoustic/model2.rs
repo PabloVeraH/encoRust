@@ -13,7 +13,7 @@ use super::fft::fft_windowed_complex;
 use super::tables::{
     absolute_threshold_db, compute_partition_map, partition_bark_centers, partition_hz_centers,
     scalefactor_sample_rate_index, spreading_db, NMT_DB, SFB_LONG_BOUNDARIES, SFB_LONG_COUNTS,
-    TMN_DB,
+    SPL_TO_DBFS_OFFSET_DB, TMN_DB,
 };
 
 // `no_std`-safe transcendental functions -- call as free functions, never
@@ -461,10 +461,16 @@ impl PsychoacousticModel {
 // ---------------------------------------------------------------------------
 
 fn ath_from_db(db: f32) -> f32 {
-    if db < -100.0 {
+    // `db` is dB SPL (Annex D's absolute-threshold-of-hearing curve).
+    // Every energy value elsewhere in this model is computed from PCM
+    // normalized to [-1.0, 1.0] (0 dBFS = 1.0, unity linear power), not
+    // absolute SPL -- see `SPL_TO_DBFS_OFFSET_DB`'s doc comment for why
+    // re-anchoring to that reference before exponentiating matters.
+    let db_fs = db - SPL_TO_DBFS_OFFSET_DB;
+    if db_fs < -240.0 {
         return 1e-20;
     }
-    exp(db * LN10_OVER_10)
+    exp(db_fs * LN10_OVER_10)
 }
 
 // ---------------------------------------------------------------------------
@@ -490,11 +496,26 @@ mod tests {
     }
 
     fn make_noise(num_samples: usize) -> Vec<f32> {
+        // xorshift32, not the LCG this used to be: an LCG's low-order
+        // bits are famously weak, but even reading only its high bits
+        // (as the earlier version did) doesn't fix a subtler issue this
+        // test actually hit -- an LCG's output has real spectral
+        // structure (a shallow low-frequency bias in this case), which
+        // isn't "broadband noise" in the sense this test needs. That
+        // bias was invisible while `ath_from_db` (see model2.rs) was
+        // miscalibrated ~96 dB too high, since the inflated ATH floor
+        // pinned nearly every partition's SMR to the same 1.0 floor
+        // regardless of the signal's actual spectral shape; fixing that
+        // calibration made this test signal's own bias visible for the
+        // first time, not the calibration fix wrong. xorshift32 has
+        // markedly better spectral flatness for this size of sample.
+        let mut state: u32 = 0x9E37_79B9;
         let mut samples = Vec::with_capacity(num_samples);
-        let mut seed: u32 = 12345;
         for _ in 0..num_samples {
-            seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
-            samples.push(((seed >> 16) as f32 / 32768.0 - 0.5) * 2.0);
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            samples.push((state as f32 / u32::MAX as f32) * 2.0 - 1.0);
         }
         samples
     }
