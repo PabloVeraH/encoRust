@@ -388,15 +388,45 @@ impl RegionSplit {
                 region0_count,
                 region1_count,
             }
+        } else if block_type == BlockType::Short {
+            // Pure short blocks (window_switching_flag == 1, block_type
+            // == 2): region0_count/region1_count aren't transmitted at
+            // all for this case, so a decoder can't derive the boundary
+            // from side info the way it does for Long -- it uses a
+            // FIXED split, unconditionally, regardless of content:
+            // region0 is lines [0, 36), region1 is [36, big_values_end).
+            // Verified directly against a working, independent decoder
+            // implementation (FlorisCreyf/mp3-decoder: `if
+            // (window_switching && block_type == 2) { region0 = 36;
+            // region1 = 576; }`) during the M11 gain/corruption
+            // investigation -- see docs/mejoras.md. An earlier version
+            // computed a content-dependent, scalefactor-band-aligned
+            // split here instead (self-consistent internally, since this
+            // encoder never decodes its own output the way a real
+            // decoder does), which desynced any real decoder the moment
+            // short blocks actually carried content spanning the
+            // mismatch -- confirmed via ffmpeg overreads once a separate
+            // fix (correcting `compute_perceptual_entropy`, see
+            // model2.rs) made short blocks trigger on real audio at all
+            // for the first time.
+            let r0_end = 36.min(big_values_end);
+            Self {
+                ranges: [(0, r0_end), (r0_end, big_values_end), (0, 0)],
+                n_regions: 2,
+                region0_count: 0,
+                region1_count: 0,
+            }
         } else {
-            // window_switching_flag == 1: 2 regions. Split at the
-            // nearest scalefactor-band boundary to the midpoint of
-            // big_values, rounded via the same `count_sf_bands_for_pairs`
-            // helper the Long case uses (keeps both cases' boundaries
-            // band-aligned, consistent with how `build_band_map` in
-            // `quantize/loop_control.rs` already treats short-block
-            // bands). See this type's doc comment for what's still
-            // unverified about this specific split point.
+            // Start/Stop (window_switching_flag == 1, block_type 1 or
+            // 3): a single long-shaped (36-sample-window, non-
+            // interleaved) MDCT, unlike pure Short's three interleaved
+            // 12-sample windows -- the fixed "36/576" rule verified for
+            // block_type == 2 above does not apply here, and this case's
+            // real fixed rule (region0_count/region1_count also aren't
+            // transmitted for Start/Stop) has not been independently
+            // verified. Left as the pre-existing content-dependent
+            // split -- not proven wrong the way block_type == 2's was,
+            // but not proven right either. See this type's doc comment.
             let half = pairs_count / 2;
             let band_count = count_sf_bands_for_pairs(half, band_end);
             let mid =
