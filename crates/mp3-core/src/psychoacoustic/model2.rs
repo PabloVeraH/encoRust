@@ -21,7 +21,7 @@ use super::tables::{
 // inherent `f32` methods that don't exist under `core`. See
 // `docs/mp3-encoder/verification/manifest.yaml`'s build-wasm note.
 use libm::{
-    atan2f as atan2, ceilf as ceil, cosf as cos, expf as exp, floorf as floor, log10f as log10,
+    atan2f as atan2, ceilf as ceil, cosf as cos, expf as exp, floorf as floor, log2f as log2,
     sqrtf as sqrt,
 };
 
@@ -42,9 +42,48 @@ const FFT_BINS_LONG: usize = FFT_SIZE_LONG / 2 + 1;
 /// yields ~48 partitions for 44.1 kHz; 64 is a safe upper bound.
 const MAX_PARTITIONS: usize = 64;
 
-/// Perceptual entropy transient detection threshold (dB increase over
-/// filtered PE). Tuning parameter — see chapter 07 §5.
-const PE_ATTACK_THRESHOLD_DB: f32 = 10.0;
+/// Perceptual entropy transient detection threshold, in dB increase of
+/// the current granule's PE over the smoothed recent baseline.
+///
+/// Despite the name, this used to be compared directly against the raw
+/// (non-dB) `pe_ratio` (`pe_ratio > 10.0`, i.e. requiring a 10x jump) —
+/// harmless by itself as just a very strict threshold, but compounded
+/// with `compute_perceptual_entropy`'s own bug (see that function's doc
+/// comment) into transient detection that could never fire on real
+/// audio at all. With that formula fixed, `pe_ratio` was measured
+/// (chickens_16bit.wav, a real recording with sharp attacks) sitting at
+/// 0.46-1.4x for ordinary content and reaching 2.1-5.7x at genuine
+/// attacks.
+///
+/// A *continuously-advancing* pure sine tone (see `make_tone_at`) still
+/// showed ~2.8x (≈4.5 dB) frame-to-frame PE variation on its own,
+/// despite being genuinely stationary -- windowed FFT bins near, but
+/// not exactly on, the tone's frequency pick up spectral leakage whose
+/// magnitude/phase don't evolve as linearly frame-to-frame as the
+/// dominant bin's does, which `compute_tonality`'s linear-prediction
+/// model reads as some unpredictability even for a pure tone. 5 dB
+/// (~3.5x) clears that synthetic-tone noise floor while still catching
+/// real content's clearer attacks (the 5.7x case above); it will miss
+/// softer ones (the 2.1x case) -- a real limitation, not a false
+/// negative introduced by this fix, since nothing triggered before it
+/// at all. The comparison now actually converts to dB (`10*log10(ratio)`)
+/// to match this constant's name and unit instead of comparing a
+/// dB-labeled constant against a raw ratio.
+const PE_ATTACK_THRESHOLD_DB: f32 = 5.0;
+
+/// Granules to treat as baseline-seeding only, never a transient
+/// candidate, before `decide_block_type` starts comparing `pe_ratio`.
+/// Matches `history`'s 2-frame depth: `compute_tonality`'s
+/// unpredictability measure needs both slots populated by real (not
+/// initial-zero) spectra to produce a stable estimate, otherwise its
+/// output swings between the first couple of calls regardless of how
+/// stationary the actual signal is -- see `granules_seen`'s doc comment.
+const PE_WARMUP_GRANULES: u8 = 2;
+
+/// `10 / log2(10)`, for converting a ratio's `log2` (this module's
+/// available transcendental function) to decibels without a separate
+/// `log10`: `10*log10(x) = 10 * log2(x)/log2(10) = log2(x) * DB_PER_LOG2`.
+const DB_PER_LOG2: f32 = 3.0103;
 
 /// Low-pass filter coefficient for smoothed PE history.
 const PE_SMOOTH_COEFF: f32 = 0.3;
@@ -156,8 +195,22 @@ pub struct PsychoacousticModel {
     /// Smoothed perceptual entropy baseline.
     smoothed_pe: f32,
 
-    /// Whether `smoothed_pe` has been seeded.
-    pe_initialized: bool,
+    /// Granules seen so far, capped at `PE_WARMUP_GRANULES` once reached.
+    /// `compute_tonality`'s unpredictability measure needs 2 full frames
+    /// of real (non-initial-zero) history to produce a stable estimate;
+    /// before that, `history`'s still-zeroed slots make tonality swing
+    /// from its typical steady-state value, which in turn swings
+    /// `part_threshold` (see `analyze_granule` Step 6) and so
+    /// `compute_perceptual_entropy`'s output — a spurious one-time PE
+    /// spike on the granule where history first becomes "mostly real",
+    /// with nothing actually transient in the audio. `decide_block_type`
+    /// treats every granule while this counter is below
+    /// `PE_WARMUP_GRANULES` as baseline-seeding only, never a candidate
+    /// transient, so that warm-up spike can't trigger a false Start --
+    /// confirmed via `stationary_tone_stays_long_after_initial_settle`,
+    /// which failed against a genuinely unchanging tone before this
+    /// counter existed.
+    granules_seen: u8,
 
     /// Current block type state machine output.
     block_type: BlockType,
@@ -182,7 +235,7 @@ impl PsychoacousticModel {
             history: [[Complex { re: 0.0, im: 0.0 }; FFT_BINS_LONG]; 2],
             partitions: None,
             smoothed_pe: 0.0,
-            pe_initialized: false,
+            granules_seen: 0,
             block_type: BlockType::Long,
             short_count: 0,
         }
@@ -313,8 +366,9 @@ impl PsychoacousticModel {
 
         // Step 8: Perceptual entropy + block-type decision
         let pe = self.compute_perceptual_entropy(
-            &mag,
-            &partitions.partition_of_bin,
+            &part_energy,
+            &part_threshold,
+            &part_tonality_count,
             partitions.num_partitions,
         );
         self.decide_block_type(pe);
@@ -388,32 +442,44 @@ impl PsychoacousticModel {
         }
     }
 
-    /// Compute perceptual entropy from the FFT magnitude spectrum.
+    /// Compute perceptual entropy: how many bits' worth of *audible*
+    /// (above-masking-threshold) information this granule carries,
+    /// weighted by each partition's bandwidth. A sudden rise relative to
+    /// the smoothed recent baseline (`decide_block_type`) signals a
+    /// transient -- the masking model's steady-state assumptions
+    /// momentarily broke down, which is exactly when window-switching to
+    /// short blocks limits how far quantization noise can spread in
+    /// time (pre-echo).
+    ///
+    /// Takes the granule's *real* per-partition energy and masking
+    /// threshold (already computed in `analyze_granule` -- spreading
+    /// function, tonality-weighted SNR, and the ATH floor all folded
+    /// in), not a re-derivation from raw FFT magnitudes. An earlier
+    /// version computed its own "threshold" as `energy_per_bin * 1e-6`
+    /// -- the *same* bin's own energy, just scaled -- which made
+    /// `energy_per_bin / thr` collapse to the constant `1e6` for every
+    /// partition with any energy at all, regardless of the signal's
+    /// actual shape. That made `pe` track only how many partitions had
+    /// nonzero energy (essentially constant for any full-spectrum
+    /// signal), never how audible or transient the content actually
+    /// was -- so `decide_block_type`'s `pe_ratio` never moved enough to
+    /// cross `PE_ATTACK_THRESHOLD_DB`, and short blocks could never
+    /// trigger on real audio (confirmed empirically: 0 of 3360 granules
+    /// on a real, percussive recording). See `docs/mejoras.md`'s
+    /// gain-bug investigation notes.
     fn compute_perceptual_entropy(
         &self,
-        mag: &[f32; FFT_BINS_LONG],
-        partition_of_bin: &[u8; FFT_BINS_LONG],
+        part_energy: &[f32; MAX_PARTITIONS],
+        part_threshold: &[f32; MAX_PARTITIONS],
+        part_count: &[usize; MAX_PARTITIONS],
         num_partitions: usize,
     ) -> f32 {
-        let mut part_energy = [0.0f32; MAX_PARTITIONS];
-        let mut part_count = [0usize; MAX_PARTITIONS];
-
-        for i in 0..FFT_BINS_LONG {
-            let p = partition_of_bin[i] as usize;
-            if p < MAX_PARTITIONS {
-                part_energy[p] += mag[i] * mag[i];
-                part_count[p] += 1;
-            }
-        }
-
         let num_p = num_partitions.min(MAX_PARTITIONS);
         let mut pe = 0.0f32;
         for p in 0..num_p {
-            if part_count[p] > 0 && part_energy[p] > 0.0 {
+            if part_count[p] > 0 && part_threshold[p] > 0.0 && part_energy[p] > part_threshold[p] {
                 let bw = part_count[p] as f32;
-                let energy_per_bin = part_energy[p] / bw;
-                let thr = energy_per_bin * 1e-6 + 1e-30;
-                pe += bw * log10(energy_per_bin / thr + 1.0);
+                pe += bw * log2(part_energy[p] / part_threshold[p]);
             }
         }
 
@@ -422,20 +488,29 @@ impl PsychoacousticModel {
 
     /// Block-type state machine based on perceptual entropy transients.
     fn decide_block_type(&mut self, pe: f32) {
-        if !self.pe_initialized {
-            self.smoothed_pe = pe;
-            self.pe_initialized = true;
+        if self.granules_seen < PE_WARMUP_GRANULES {
+            self.granules_seen += 1;
+            self.smoothed_pe = if self.granules_seen == 1 {
+                pe
+            } else {
+                PE_SMOOTH_COEFF * pe + (1.0 - PE_SMOOTH_COEFF) * self.smoothed_pe
+            };
             return;
         }
 
         let baseline = self.smoothed_pe.max(PE_BASELINE_FLOOR);
         let pe_ratio = pe / baseline;
+        let pe_ratio_db = if pe_ratio > 0.0 {
+            log2(pe_ratio) * DB_PER_LOG2
+        } else {
+            f32::NEG_INFINITY
+        };
 
         self.smoothed_pe = PE_SMOOTH_COEFF * pe + (1.0 - PE_SMOOTH_COEFF) * self.smoothed_pe;
 
         match self.block_type {
             BlockType::Long => {
-                if pe_ratio > PE_ATTACK_THRESHOLD_DB {
+                if pe_ratio_db > PE_ATTACK_THRESHOLD_DB {
                     self.block_type = BlockType::Start;
                     self.short_count = 3;
                 }
@@ -487,9 +562,34 @@ mod tests {
     use libm::sinf as sin;
 
     fn make_tone(freq: f32, sample_rate: u32, num_samples: usize) -> Vec<f32> {
+        make_tone_at(freq, sample_rate, num_samples, 0)
+    }
+
+    /// Like `make_tone`, but starting at time `start_sample / sample_rate`
+    /// instead of always t=0. Needed for any test that calls
+    /// `analyze_granule` more than once and wants each call to represent
+    /// the *next* chunk of one continuous signal: `compute_tonality`
+    /// linearly extrapolates each FFT bin's magnitude and phase from the
+    /// previous two frames, which is only a meaningful predictor if the
+    /// frames actually advance in time the way real, continuously
+    /// sampled audio does. Calling `make_tone` repeatedly (always t=0)
+    /// instead feeds the *identical* window every time, which has zero
+    /// phase evolution between calls -- not "maximally stationary" from
+    /// the predictor's perspective, but a discontinuity from what it's
+    /// designed to predict, producing spurious unpredictability
+    /// (confirmed empirically: `stationary_tone_stays_long_after_
+    /// initial_settle` failed against a repeated-window tone regardless
+    /// of how many warm-up calls `decide_block_type` was given, until
+    /// switched to this continuously-advancing generator).
+    fn make_tone_at(
+        freq: f32,
+        sample_rate: u32,
+        num_samples: usize,
+        start_sample: usize,
+    ) -> Vec<f32> {
         let mut samples = Vec::with_capacity(num_samples);
         for i in 0..num_samples {
-            let t = i as f32 / sample_rate as f32;
+            let t = (start_sample + i) as f32 / sample_rate as f32;
             samples.push(sin(2.0 * PI * freq * t));
         }
         samples
@@ -649,11 +749,20 @@ mod tests {
 
     #[test]
     fn stationary_tone_stays_long_after_initial_settle() {
+        // Each call represents the *next* chunk of one continuous tone
+        // (hop = 576, matching the real 1152-sample-frame/2-granule
+        // encoder pipeline in encoder.rs), not a repeated, non-advancing
+        // window -- see `make_tone_at`'s doc comment for why that
+        // distinction matters to the tonality predictor this exercises.
         let mut model = make_model(44100);
-        let tone = make_tone(440.0, 44100, 1024);
-        model.analyze_granule(&tone, 44100);
+        const HOP: usize = 576;
+        for i in 0..PE_WARMUP_GRANULES as usize {
+            let tone = make_tone_at(440.0, 44100, 1024, i * HOP);
+            model.analyze_granule(&tone, 44100);
+        }
 
-        for _ in 0..10 {
+        for i in PE_WARMUP_GRANULES as usize..PE_WARMUP_GRANULES as usize + 10 {
+            let tone = make_tone_at(440.0, 44100, 1024, i * HOP);
             let (_, bt) = model.analyze_granule(&tone, 44100);
             assert_eq!(
                 bt,
