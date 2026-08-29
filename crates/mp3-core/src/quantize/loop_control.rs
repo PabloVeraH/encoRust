@@ -479,6 +479,38 @@ pub fn quantize_granule(
         let (signal_e, distort_e) =
             compute_band_distortion(spectrum, &recon, &band_of_line, num_bands);
 
+        // Bands already saturating `MAX_REPRESENTABLE_IX` (see
+        // `quantize_spectrum`'s doc comment) can't be pushed any finer:
+        // the *global* step chosen next iteration only ever gets finer
+        // when there's bit budget to spare (the binary-search rate loop
+        // in `inner_loop` picks the finest step the budget allows), and
+        // scalefactor's per-band boost stacks multiplicatively on top of
+        // that -- so a further increment here wouldn't reduce this
+        // band's real distortion at all, it would just widen the gap
+        // between what `ix` is capped at and what the *declared*
+        // scalefactor claims, which a real decoder reconstructs from
+        // the (unclamped-in-its-math) formula. Concretely: for genuinely
+        // tonal content with a generous bit budget, this loop used to
+        // keep incrementing such a band every iteration up to the
+        // MAX_OUTER_ITERATIONS cap regardless, saturating `ix` there and
+        // producing a *wrong*, not just coarser, reconstruction -- and
+        // since the granule-by-granule outer loop has no continuity
+        // constraint across time, two adjacent granules encoding the
+        // *same* stationary tone could saturate by different amounts,
+        // producing audible amplitude modulation on content a
+        // reference encoder (LAME) reconstructs with ~1.0 sample
+        // correlation to the original. See docs/mejoras.md's
+        // gain/corruption investigation notes for how this was
+        // diagnosed (differential correlation against LAME's own
+        // encode of the same material, not just this crate's internal
+        // consistency).
+        let mut saturated = [false; 22];
+        for (&line_band, &ix) in band_of_line.iter().zip(ir.ix.iter()) {
+            if ix >= MAX_REPRESENTABLE_IX && line_band < 22 {
+                saturated[line_band] = true;
+            }
+        }
+
         let mut retry = false;
         for b in 0..num_bands {
             let allowed = if smr.bands[b] > 1.0 {
@@ -487,7 +519,7 @@ pub fn quantize_granule(
                 f32::MAX
             };
 
-            if distort_e[b] > allowed && scalefac[b] < MAX_SCALEFAC {
+            if distort_e[b] > allowed && scalefac[b] < MAX_SCALEFAC && !saturated[b] {
                 scalefac[b] += 1;
                 retry = true;
             }
@@ -817,21 +849,51 @@ mod tests {
 
     #[test]
     fn outer_loop_amplifies_unmasked_band() {
+        // A single active band, resolved by `inner_loop`'s full-range
+        // binary search alone (see that function's doc comment): with
+        // nothing else in the spectrum competing for bits, the search
+        // just picks whatever global step makes *this* band as precise
+        // as the budget allows -- no scalefactor amplification needed
+        // to satisfy even a strict SMR demand on it. An earlier version
+        // of the rate loop's narrower, upward-only search couldn't do
+        // that, so this test's original single-band setup only ever
+        // demonstrated the outer loop's amplification path by relying
+        // on that narrower search's limits, not on any real trade-off.
+        //
+        // To exercise scalefactor amplification meaningfully now, this
+        // needs two bands *competing* for the same (tight) bit budget:
+        // one with a strict SMR demand, one tolerant. A shared global
+        // step can satisfy at most one well; only per-band scalefactor
+        // differentiation can keep the strict band precise while
+        // staying under budget.
+        let band_map = make_band_map_44100();
+        let strict_band = band_map[20];
+        let tolerant_band = band_map[400];
+        assert_ne!(
+            strict_band, tolerant_band,
+            "test setup needs two distinct scalefactor bands"
+        );
+
         let mut spectrum = [0.0f32; 576];
         for i in 20..25 {
+            spectrum[i] = 0.8;
+        }
+        for i in 400..405 {
             spectrum[i] = 0.8;
         }
 
         let mut smr = ScalefactorBandSmr {
             bands: [1.0f32; 22],
         };
-        smr.bands[5] = 100.0; // band 5 demands very low distortion
+        smr.bands[strict_band] = 1e5; // demands very low distortion
 
-        let result = quantize_granule(&spectrum, &smr, 500, BlockType::Long, 44100);
+        let result = quantize_granule(&spectrum, &smr, 60, BlockType::Long, 44100);
         assert!(
-            result.scalefac.values[5] > 0,
-            "unmasked band 5 should get amplified scalefactor, got {}",
-            result.scalefac.values[5]
+            result.scalefac.values[strict_band] > result.scalefac.values[tolerant_band],
+            "strict band ({strict_band}) should get more scalefactor amplification \
+             than the tolerant band ({tolerant_band}): strict={}, tolerant={}",
+            result.scalefac.values[strict_band],
+            result.scalefac.values[tolerant_band]
         );
     }
 
