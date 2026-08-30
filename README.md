@@ -158,6 +158,19 @@ encorust input.wav -o output.mp3 -b 192        # CBR
 encorust input.wav -o output.mp3 --abr 128      # ABR
 ```
 
+## Other Rust Audio Codecs
+
+MP3 isn't always the right codec for the job. If you're looking at this
+project but actually need something else, these are worth a look:
+
+- [`opus-pure`](https://docs.rs/opus-pure/latest/opus_pure/) — a
+  pure-Rust Opus codec (RFC 6716), encoder and decoder, no C
+  dependencies.
+- [`opus`](https://docs.rs/opus/latest/opus/) — high-level Rust bindings
+  to libopus (the C reference implementation), encoder and decoder.
+- [`fdk-aac-sys`](https://docs.rs/fdk-aac-sys/latest/fdk_aac_sys/) — raw
+  FFI bindings to Fraunhofer's FDK AAC library, encoder and decoder.
+
 ## License
 
 MIT OR Apache-2.0, at your option.
