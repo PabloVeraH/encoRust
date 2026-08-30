@@ -87,7 +87,7 @@ impl PolyphaseFilterbank {
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)] // f32::abs() in test assertions -- see docs/mejoras.md §7 item 6
+#[allow(clippy::disallowed_methods)] // f32::abs() in test assertions -- see docs/investigation-log.md §7 item 6
 mod tests {
     use super::*;
     use core::f32::consts::PI;

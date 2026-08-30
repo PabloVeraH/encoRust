@@ -38,6 +38,86 @@ pub enum BlockType {
     Stop,
 }
 
+/// Unified per-granule shape type that replaces bare [`BlockType`] in
+/// pipeline stages that must agree on window layout. Making the shape
+/// explicit instead of passing a `BlockType` to each stage independently
+/// turns "I forgot to wire block_type into stage X" into a compile error
+/// rather than a desynchronized bitstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GranuleShape {
+    /// Long block or transition block (Start/Stop — both use the 36-
+    /// sample MDCT window, only the window shape differs).
+    Long {
+        /// Which 36-sample window to use.
+        kind: LongWindowKind,
+    },
+    /// Three 12-sample short windows per granule (pure short; mixed
+    /// blocks deferred — see `docs/plus.md` §2, M11.1).
+    Short {
+        /// Whether this granule mixes in long subbands at low frequencies
+        /// (`mixed_block_flag=true`). Deferred for now; always `false`.
+        mixed: bool,
+    },
+}
+
+/// Specific type within the long-block window family. Start/Stop are
+/// transition windows that preserve energy at L↔S boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LongWindowKind {
+    /// Normal stationary-window.
+    Normal,
+    /// Transition into short blocks.
+    Start,
+    /// Transition back to long blocks.
+    Stop,
+}
+
+impl GranuleShape {
+    /// Converts from the psychoacoustic model's raw `BlockType` decision
+    /// into the unified shape. `Short` maps to `GranuleShape::Short`;
+    /// `Long`/`Start`/`Stop` all map to `GranuleShape::Long` with the
+    /// appropriate `LongWindowKind`.
+    #[must_use]
+    pub fn from_block_type(bt: BlockType, mixed: bool) -> Self {
+        match bt {
+            BlockType::Long => Self::Long {
+                kind: LongWindowKind::Normal,
+            },
+            BlockType::Start => Self::Long {
+                kind: LongWindowKind::Start,
+            },
+            BlockType::Short => Self::Short { mixed },
+            BlockType::Stop => Self::Long {
+                kind: LongWindowKind::Stop,
+            },
+        }
+    }
+
+    /// Returns the underlying `BlockType` for stages that still need it
+    /// (side-info serialization, scalefactor band lookup).
+    #[must_use]
+    pub fn block_type(&self) -> BlockType {
+        match self {
+            Self::Long { kind } => match kind {
+                LongWindowKind::Normal => BlockType::Long,
+                LongWindowKind::Start => BlockType::Start,
+                LongWindowKind::Stop => BlockType::Stop,
+            },
+            Self::Short { .. } => BlockType::Short,
+        }
+    }
+
+    /// Whether this granule uses short windows (`window_switching_flag=1`
+    /// in side info). True for `Short`, `Start`, `Stop`; false for `Long`.
+    #[must_use]
+    pub fn is_window_switching(&self) -> bool {
+        match self {
+            Self::Long { kind } => !matches!(kind, LongWindowKind::Normal),
+            Self::Short { .. } => true,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Window functions (closed-form trigonometric, per Annex B)
 // ---------------------------------------------------------------------------
@@ -116,6 +196,16 @@ pub fn stop_window() -> [f32; 36] {
     w
 }
 
+/// Returns the 36-sample window for a long-block kind. Short blocks use
+/// the 12-sample short window (applied locally).
+pub fn long_window_for_kind(kind: LongWindowKind) -> [f32; 36] {
+    match kind {
+        LongWindowKind::Normal => long_window(),
+        LongWindowKind::Start => start_window(),
+        LongWindowKind::Stop => stop_window(),
+    }
+}
+
 /// Returns the 36-sample window for a given BlockType. Short blocks
 /// use the 12-sample short window (applied locally — callers handle the
 /// 3-window loop). Panics if passed `BlockType::Short` — that case must
@@ -135,8 +225,35 @@ pub fn window_for_type(bt: BlockType) -> [f32; 36] {
 
 /// Forward MDCT for a 36-sample long/start/stop windowed input → 18 lines.
 ///
-/// `X[k] = Σ_{n=0}^{35} z[n] * cos(π/36 * (n + 9.5) * (2k+1))`
+/// `X[k] = (2/18) * Σ_{n=0}^{35} z[n] * cos(π/36 * (n + 9.5) * (2k+1))`
+///
+/// The `2/N` (N=18) factor is required because a standards-compliant
+/// decoder's IMDCT applies **no** normalization of its own — verified
+/// directly against a working, independent decoder implementation
+/// (FlorisCreyf/mp3-decoder's `imdct()`: a raw cosine sum, no `2/N` or
+/// any other multiplier, before windowing). The forward and inverse
+/// cosine kernels used here form an (unnormalized) DCT-IV-like pair, for
+/// which applying the raw kernel on *both* sides compounds to a gain of
+/// `N/2` (a standard property of that transform, not specific to MP3) —
+/// so encoding without this factor and decoding with a real, compliant
+/// decoder reconstructs audio `N/2` (9x, +19 dB for long blocks) too
+/// loud, on top of whatever the psychoacoustic model and quantizer
+/// separately get right.
+///
+/// This alone isn't sufficient: pairing it with the quantizer's rate
+/// loop as it stood (searching `step` only upward from a fixed 0 —
+/// implicitly assuming `spectrum` magnitudes already fit that baseline)
+/// made real content collapse to complete silence instead, since this
+/// factor shrinks `spectrum`'s magnitudes and nothing else compensated.
+/// Fixed together with `quantize::loop_control::inner_loop` searching
+/// the *entire* representable `step` range instead — see that function's
+/// doc comment. Diagnosed empirically via ffmpeg/symphonia differential
+/// decoding against real recordings (this crate's own quantize/
+/// dequantize round-trip is self-consistent regardless of this factor,
+/// which is exactly why testing only against this encoder's own logic
+/// hid it) — see `docs/investigation-log.md`'s gain-bug investigation notes.
 pub fn mdct_36(z: &[f32; 36]) -> [f32; 18] {
+    const SCALE: f32 = 2.0 / 18.0;
     let mut out = [0.0f32; 18];
     for (k, item) in out.iter_mut().enumerate() {
         let omega = PI / 36.0 * (2.0 * k as f32 + 1.0);
@@ -144,15 +261,19 @@ pub fn mdct_36(z: &[f32; 36]) -> [f32; 18] {
         for (n, &zn) in z.iter().enumerate() {
             sum += zn * cos((n as f32 + 9.5) * omega);
         }
-        *item = sum;
+        *item = sum * SCALE;
     }
     out
 }
 
 /// Forward MDCT for a 12-sample short-windowed input → 6 lines.
 ///
-/// `X[k] = Σ_{n=0}^{11} z[n] * cos(π/12 * (n + 3.5) * (2k+1))`
+/// `X[k] = (2/6) * Σ_{n=0}^{11} z[n] * cos(π/12 * (n + 3.5) * (2k+1))`
+///
+/// See [`mdct_36`]'s doc comment for why this `2/N` (N=6) factor is
+/// required to match a compliant decoder's unnormalized IMDCT.
 pub fn mdct_12(z: &[f32; 12]) -> [f32; 6] {
+    const SCALE: f32 = 2.0 / 6.0;
     let mut out = [0.0f32; 6];
     for (k, item) in out.iter_mut().enumerate() {
         let omega = PI / 12.0 * (2.0 * k as f32 + 1.0);
@@ -160,7 +281,7 @@ pub fn mdct_12(z: &[f32; 12]) -> [f32; 6] {
         for (n, &zn) in z.iter().enumerate() {
             sum += zn * cos((n as f32 + 3.5) * omega);
         }
-        *item = sum;
+        *item = sum * SCALE;
     }
     out
 }
@@ -169,7 +290,7 @@ pub fn mdct_12(z: &[f32; 12]) -> [f32; 6] {
 /// `prev_tail` (old) + `input` (new) → window → forward MDCT.
 ///
 /// `window` should be precomputed once per block type (`long_window()`,
-/// etc.) and reused across all 32 subbands — see `docs/mejoras.md` §3.2
+/// etc.) and reused across all 32 subbands — see `docs/investigation-log.md` §3.2
 /// M-4.
 pub fn transform_long(
     input: &[f32; 18],
@@ -208,40 +329,109 @@ pub fn transform_short(windows: &[[f32; 12]; 3]) -> [[f32; 6]; 3] {
 
 /// Inverse MDCT for a long block (N=18). Returns 36 time-domain samples.
 /// The caller must overlap-add with the previous block's second half.
+///
+/// Deliberately **unnormalized** — matching a real, standards-compliant
+/// decoder's IMDCT (verified against an independent, working
+/// implementation; see [`mdct_36`]'s doc comment), not the `2/N` this
+/// function used to apply. `mdct_36` now carries that `2/N` factor on
+/// the forward side instead, so this stays a faithful stand-in for an
+/// external decoder in the perfect-reconstruction test below — an
+/// earlier version of this function reapplied `2/N` here too, which
+/// would have canceled `mdct_36`'s new factor and hidden the very bug
+/// it exists to catch.
 #[cfg(test)]
 fn imdct_36(spec: &[f32; 18]) -> [f32; 36] {
     let mut out = [0.0f32; 36];
-    let scale = 2.0 / 18.0;
     for (n, out_n) in out.iter_mut().enumerate() {
         let omega = PI / 36.0 * (n as f32 + 9.5);
         let mut sum = 0.0;
         for (k, &spec_k) in spec.iter().enumerate() {
             sum += spec_k * cos((2.0 * k as f32 + 1.0) * omega);
         }
-        *out_n = sum * scale;
+        *out_n = sum;
     }
     out
 }
 
 /// Inverse MDCT for a short block (N=6), returning 12 samples.
+/// See [`imdct_36`]'s doc comment: deliberately unnormalized.
 #[cfg(test)]
 fn imdct_12(spec: &[f32; 6]) -> [f32; 12] {
     let mut out = [0.0f32; 12];
-    let scale = 2.0 / 6.0;
     for (n, out_n) in out.iter_mut().enumerate() {
         let omega = PI / 12.0 * (n as f32 + 3.5);
         let mut sum = 0.0;
         for (k, &spec_k) in spec.iter().enumerate() {
             sum += spec_k * cos((2.0 * k as f32 + 1.0) * omega);
         }
-        *out_n = sum * scale;
+        *out_n = sum;
     }
     out
 }
 
 // ---------------------------------------------------------------------------
-// Anti-aliasing butterfly
+// Reorder for short blocks (ISO/IEC 11172-3 §2.4.3.4.9)
 // ---------------------------------------------------------------------------
+
+/// Reorder a 576-line spectrum for short blocks from natural subband-
+/// major/window-minor layout to the interleaved scalefactor-band layout
+/// the quantizer and Huffman coder expect.
+///
+/// # Layout
+///
+/// **Input (natural):** `spectrum[sb*18 + wi*6 + k]` = subband `sb`,
+/// window `wi` (0-2), spectral line `k` (0-5).
+///
+/// **Output (interleaved):** 12 scalefactor bands × 3 windows × width
+/// lines, laid out contiguously per band. This groups same-band data
+/// across all 3 windows, matching `build_band_map`'s short-block layout
+/// in `loop_control.rs`.
+///
+/// `sfb_boundaries` gives line boundaries *within one 192-line window*
+/// (not flat indices). The flat interleaved boundary for band `b` is
+/// `3 * sfb_boundaries[b]`.
+pub fn reorder_short(
+    spectrum: &[f32; 576],
+    sfb_boundaries: &[usize],
+    num_bands: usize,
+) -> [f32; 576] {
+    let mut out = [0.0f32; 576];
+
+    // For each scalefactor band: copy the band's spectral lines from
+    // all 3 windows contiguously into the output.
+    for band in 0..num_bands {
+        let band_start_line = sfb_boundaries[band]; // within one window
+        let band_end_line = sfb_boundaries[band + 1].min(192);
+        let band_width = band_end_line - band_start_line;
+
+        // Destination: flat interleaved position
+        let dst_start = 3 * band_start_line;
+
+        for wi in 0..3 {
+            let _win_offset = wi * 6; // window offset within subband
+            for line in 0..band_width {
+                let spectral_line = band_start_line + line; // within one window
+
+                // Find which subband this line belongs to.
+                // With 32 subbands, each subband contributes 6 lines per
+                // short window (32 × 6 = 192). A single subband contains
+                // lines: sb=0 has lines 0-5, sb=1 has 6-11, etc.
+                let sb = spectral_line / 6;
+                let line_in_sb = spectral_line % 6;
+
+                // Natural layout: subband-major, window-minor within subband
+                let src = sb * 18 + wi * 6 + line_in_sb;
+
+                // Interleaved layout: band-major, window-minor within band
+                let dst = dst_start + wi * band_width + line;
+
+                out[dst] = spectrum[src];
+            }
+        }
+    }
+
+    out
+}
 
 /// Cosine (`cs`) / sine (`ca`) rotation coefficients for the 8-point
 /// anti-aliasing butterfly (ISO/IEC 11172-3 §2.4.3.4.9.4).
@@ -311,7 +501,7 @@ pub fn antialias_butterfly(
 // Test fixtures/expected-value construction mirrors the standard's own
 // subscript notation throughout this module — see the module doc
 // comment above. Scoped to `tests` only; production code no longer
-// carries this allow (see docs/mejoras.md §7 item 6).
+// carries this allow (see docs/investigation-log.md §7 item 6).
 #[allow(clippy::needless_range_loop, clippy::disallowed_methods)]
 mod tests {
     use super::*;
@@ -476,6 +666,57 @@ mod tests {
 
     // --- Forward transform API tests ---
 
+    /// Regression coverage the perfect-reconstruction tests above don't
+    /// provide: they verify a single MDCT block pair in isolation, never
+    /// `Encoder::mdct_stage`'s actual `mdct_prev_tail`-chaining pattern
+    /// across a run of granules. Simulates that exact `transform_long`
+    /// call and tail-update pattern for a single subband across several
+    /// consecutive granules, with a synthetic, continuous subband-domain
+    /// signal (isolated from the filterbank/psychoacoustic model
+    /// entirely). Added while investigating docs/investigation-log.md §11, "Where
+    /// the next session should start", step 3 (2026-08-29): this passing
+    /// cleanly rules the tail-passing mechanism itself out as that
+    /// investigation's fidelity-bug source -- kept as a permanent guard
+    /// against a regression there.
+    #[test]
+    fn transform_long_multi_granule_chaining_reconstructs() {
+        let w = long_window();
+        let n_granules = 6;
+        let signal: Vec<f32> = (0..18 * n_granules)
+            .map(|i| sin(i as f32 * 0.9) + 0.4 * sin(i as f32 * 0.31))
+            .collect();
+
+        let mut prev_tail = [0.0f32; 18];
+        let mut specs = Vec::new();
+        for gr in 0..n_granules {
+            let mut input = [0.0f32; 18];
+            input.copy_from_slice(&signal[gr * 18..gr * 18 + 18]);
+            let (spec, new_tail) = transform_long(&input, &prev_tail, &w);
+            specs.push(spec);
+            prev_tail = new_tail;
+        }
+
+        // The overlap between granule (gr-1) and granule gr's *z* arrays
+        // is granule (gr-1)'s own raw `input` -- i.e. `signal[(gr-1)*18
+        // .. gr*18)`, not granule gr's slice. See `transform_long`: its
+        // returned tail is `*input` for the granule that just ran, which
+        // becomes the *next* call's `prev_tail`, so the shared raw data
+        // between two consecutive granules' `z` blocks is always the
+        // earlier granule's own input.
+        for gr in 1..n_granules {
+            let y_prev = imdct_36(&specs[gr - 1]);
+            let y_cur = imdct_36(&specs[gr]);
+            for i in 0..18 {
+                let reconstructed = y_prev[18 + i] * w[18 + i] + y_cur[i] * w[i];
+                let expected = signal[(gr - 1) * 18 + i];
+                assert!(
+                    (reconstructed - expected).abs() < 1e-3,
+                    "granule {gr}, i={i}: got {reconstructed}, expected {expected}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn transform_long_returns_prev_as_tail() {
         let input = [0.5f32; 18];
@@ -631,5 +872,57 @@ mod tests {
         // effect) but energy is roughly conserved.
         let diff = (leakage_before - leakage_after).abs();
         assert!(diff > 1e-6, "butterfly should modify the spectrum");
+    }
+
+    // --- Reorder tests ---
+
+    #[test]
+    fn reorder_short_preserves_all_values() {
+        let mut spectrum = [0.0f32; 576];
+        for i in 0..576 {
+            spectrum[i] = i as f32;
+        }
+        let boundaries: Vec<usize> = (0..=12).map(|b| b * 16).collect();
+        let out = reorder_short(&spectrum, &boundaries, 12);
+
+        let mut seen = [false; 576];
+        for &v in &out {
+            let idx = v as usize;
+            assert!(idx < 576, "value {v} out of range");
+            assert!(!seen[idx], "value {idx} appears twice");
+            seen[idx] = true;
+        }
+        assert!(
+            seen.iter().all(|&s| s),
+            "not all values 0..575 were preserved"
+        );
+    }
+
+    #[test]
+    fn reorder_short_is_permutation() {
+        // The reorder must preserve all values — it's a permutation,
+        // not a transform that changes values.
+        let mut spectrum = [0.0f32; 576];
+        for i in 0..576 {
+            spectrum[i] = (i as f32 * 1.3).sin();
+        }
+        let boundaries: Vec<usize> = (0..=12).map(|b| b * 16).collect();
+        let out = reorder_short(&spectrum, &boundaries, 12);
+
+        let mut src_sorted: Vec<f32> = spectrum.to_vec();
+        src_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mut out_sorted: Vec<f32> = out.to_vec();
+        out_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        for (a, b) in src_sorted.iter().zip(out_sorted.iter()) {
+            assert!((a - b).abs() < 1e-6, "reorder must be a permutation");
+        }
+
+        // The layout must actually change
+        let diff: f32 = out
+            .iter()
+            .zip(spectrum.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        assert!(diff > 0.1, "reorder should change the layout");
     }
 }

@@ -83,12 +83,32 @@ pub fn absolute_threshold_db(freq_hz: f32) -> f32 {
     term1 + term2 + term3
 }
 
+/// Conventional SPL level of a full-scale 16-bit digital signal. Annex
+/// D's `absolute_threshold_db` curve is anchored at 0 dB **SPL**, but
+/// every energy value elsewhere in the psychoacoustic model is computed
+/// from PCM normalized to `[-1.0, 1.0]` — i.e. anchored at 0 dBFS. This
+/// offset re-anchors the ATH curve to that same reference before
+/// converting to linear power, via `db_spl - SPL_TO_DBFS_OFFSET_DB`.
+///
+/// Without it, `absolute_threshold_linear` comes out within about an
+/// order of magnitude of full-scale signal power itself (since the ATH
+/// curve's minimum sits close to 0 dB) instead of ~90+ dB below it. For
+/// real (not full-scale) recordings, that inflated floor dominates
+/// `part_threshold` almost everywhere, pinning `part_smr` at its floor
+/// of 1.0 for nearly every band — which starves the outer (distortion)
+/// loop's masking-driven scalefactor amplification of any real signal
+/// to react to, since it only retries `if smr.bands[b] > 1.0` (strictly
+/// greater). The audible result is an elevated broadband quantization
+/// noise floor: bands that should get extra precision under real
+/// masking get none, because the model never told the quantizer they
+/// needed it.
+pub const SPL_TO_DBFS_OFFSET_DB: f32 = 96.0;
+
 /// Absolute threshold of hearing converted to linear power (relative to
-/// full scale). The 96 dB offset converts from SPL to a nominal full-scale
-/// reference (the psychoacoustic model operates relative to the signal
-/// level, not absolute SPL).
+/// full scale). See [`SPL_TO_DBFS_OFFSET_DB`] for why the offset is
+/// needed before exponentiating.
 pub fn absolute_threshold_linear(freq_hz: f32) -> f32 {
-    let db = absolute_threshold_db(freq_hz);
+    let db = absolute_threshold_db(freq_hz) - SPL_TO_DBFS_OFFSET_DB;
     let ln10_over_10 = core::f32::consts::LN_10 / 10.0;
     exp(db * ln10_over_10)
 }
@@ -344,7 +364,7 @@ pub fn sfb_short_checksum() -> u64 {
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)] // f32::abs() in test assertions -- see docs/mejoras.md §7 item 6
+#[allow(clippy::disallowed_methods)] // f32::abs() in test assertions -- see docs/investigation-log.md §7 item 6
 mod tests {
     use super::*;
 

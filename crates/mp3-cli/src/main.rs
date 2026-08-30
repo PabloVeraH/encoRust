@@ -28,12 +28,20 @@ struct Args {
     bitrate: Option<u32>,
 
     /// Average bitrate in kbps (not yet implemented — use `--bitrate`).
+    /// See docs/investigation-log.md §2.2 and docs/plus.md M13.
     #[arg(long, conflicts_with_all = ["bitrate", "vbr_quality"])]
     abr: Option<u32>,
 
     /// VBR quality target, 0 (highest) - 9 (smallest) — not yet implemented.
+    /// See docs/investigation-log.md §2.2 and docs/plus.md M13.
     #[arg(long, conflicts_with_all = ["bitrate", "abr"])]
     vbr_quality: Option<u8>,
+
+    /// Use mid/side joint stereo instead of discrete stereo (2-channel
+    /// input only; intensity stereo is not implemented — see
+    /// docs/plus.md §3.1).
+    #[arg(long)]
+    joint_stereo: bool,
 }
 
 fn sample_rate_from_hz(hz: u32) -> Option<SampleRate> {
@@ -73,7 +81,13 @@ fn run() -> anyhow::Result<()> {
     })?;
 
     let channel_mode = match spec.channels {
-        1 => ChannelMode::Mono,
+        1 => {
+            if args.joint_stereo {
+                bail!("--joint-stereo requires 2-channel input, got mono");
+            }
+            ChannelMode::Mono
+        }
+        2 if args.joint_stereo => ChannelMode::JointStereoMs,
         2 => ChannelMode::Stereo,
         n => bail!("unsupported channel count: {n} (expected 1 or 2)"),
     };
@@ -86,12 +100,12 @@ fn run() -> anyhow::Result<()> {
     } else if args.abr.is_some() {
         bail!(
             "ABR rate control is not yet implemented. Use --bitrate for CBR \
-             encoding instead. See docs/mejoras.md §2.2."
+             encoding instead. See docs/investigation-log.md §2.2 and docs/plus.md M13."
         );
     } else if args.vbr_quality.is_some() {
         bail!(
             "VBR rate control is not yet implemented. Use --bitrate for CBR \
-             encoding instead. See docs/mejoras.md §2.2."
+             encoding instead. See docs/investigation-log.md §2.2 and docs/plus.md M13."
         );
     } else {
         bail!("specify --bitrate (--abr and --vbr-quality are not yet implemented)");

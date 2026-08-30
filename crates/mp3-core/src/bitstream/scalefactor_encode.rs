@@ -225,7 +225,7 @@ mod tests {
     // production code never names it as a bare identifier (only via
     // `BitWriter`'s own `alloc::vec::Vec` buffer parameter) — pre-existing
     // gap, only surfaced once `cargo test --no-default-features` actually
-    // ran (see docs/mejoras.md's review notes; same regression class as
+    // ran (see docs/investigation-log.md's review notes; same regression class as
     // the module doc comment's no_std `Vec`/`vec!` warning already flags).
     use crate::bitstream::writer::BitWriter;
     use crate::mdct::BlockType;

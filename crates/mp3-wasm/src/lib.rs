@@ -4,7 +4,7 @@
 //!
 //! Buffer reuse (M-5): `scratch_frame` and passing `&mut output` directly
 //! to `encode_frame`/`finish` eliminates intermediate `Vec::new()` calls
-//! per completed frame. See `docs/mejoras.md` §3.2.
+//! per completed frame. See `docs/investigation-log.md` §3.2.
 
 extern crate alloc;
 

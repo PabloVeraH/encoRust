@@ -60,7 +60,7 @@ pub enum EncodeError {
     /// is not yet implemented: VBR and ABR are placeholders that silently
     /// produce fixed 128 kbps CBR output with no warning. Fail loudly
     /// instead of silently ignoring the user's request. See
-    /// `docs/mejoras.md` §2.2.
+    /// `docs/investigation-log.md` §2.2.
     #[error("rate-control mode not yet implemented by this encoder: {variant}")]
     UnsupportedRateControl {
         /// The rejected rate-control variant ("Vbr" or "Abr").

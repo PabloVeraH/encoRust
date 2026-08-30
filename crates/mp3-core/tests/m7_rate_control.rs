@@ -78,7 +78,7 @@ fn encode_one_granule(
 
     let mut out = Vec::new();
     let mut writer = BitWriter::new(&mut out);
-    encode_granule(&result.ix, &mut writer);
+    encode_granule(&result.ix, BlockType::Long, &mut writer);
     writer.flush();
     (out.len() * 8) as u32
 }

@@ -159,20 +159,96 @@ fn rejects_lsf_sample_rates() {
 
 #[test]
 fn rejects_joint_stereo_modes() {
-    for mode in [
-        ChannelMode::JointStereoMs,
+    // JointStereoIntensity is still rejected (M12 implements MS, not intensity).
+    let config = EncoderConfig::new(
+        SampleRate::Hz44100,
         ChannelMode::JointStereoIntensity,
-    ] {
-        let config = EncoderConfig::new(
-            SampleRate::Hz44100,
-            mode,
-            RateControl::Cbr(Bitrate::Kbps128),
-        );
-        assert!(
-            Encoder::new(config).is_err(),
-            "{mode:?} should be rejected until the MS/intensity transform exists"
-        );
+        RateControl::Cbr(Bitrate::Kbps128),
+    );
+    assert!(
+        Encoder::new(config).is_err(),
+        "JointStereoIntensity should still be rejected"
+    );
+}
+
+#[test]
+fn joint_stereo_ms_is_accepted() {
+    let config = EncoderConfig::new(
+        SampleRate::Hz44100,
+        ChannelMode::JointStereoMs,
+        RateControl::Cbr(Bitrate::Kbps128),
+    );
+    assert!(
+        Encoder::new(config).is_ok(),
+        "JointStereoMs should be accepted"
+    );
+}
+
+/// `Encoder::new` succeeding says nothing about `encode_frame` actually
+/// working. This exercises the real pipeline with stereo content
+/// deliberately shaped so the two channels' psychoacoustic models are
+/// likely to make *different* transient (block_type) decisions on the
+/// same granule -- left channel has a sharp attack partway through the
+/// stream, right channel stays quiet throughout -- which is exactly the
+/// case the block-type reconciliation step (`docs/plus.md` M12 review)
+/// exists for. This doesn't decode the output (no reference decoder
+/// dependency in this crate), but every internal consistency invariant
+/// `encode_frame` checks via `debug_assert!` (side-info bit widths,
+/// main_data capacity, granule shape agreement) runs in a debug test
+/// build, so a reconciliation regression that reintroduces mismatched
+/// shapes has a real chance of tripping one of those rather than
+/// silently producing a plausible-looking but wrong frame.
+#[test]
+fn joint_stereo_ms_encodes_divergent_channel_content_without_panicking() {
+    let config = EncoderConfig::new(
+        SampleRate::Hz44100,
+        ChannelMode::JointStereoMs,
+        RateControl::Cbr(Bitrate::Kbps128),
+    );
+    let mut encoder = Encoder::new(config).expect("encoder creation");
+
+    let n_frames = 10;
+    let n_samples = 1152 * n_frames;
+    let mut interleaved = vec![0i16; n_samples * 2];
+    for i in 0..n_samples {
+        // Left: quiet, then a sharp attack after the halfway point.
+        let left = if i < n_samples / 2 {
+            (0.01 * libm::sinf(i as f32 * 0.5) * 20000.0) as i16
+        } else {
+            (0.85 * libm::sinf(i as f32 * 1.3) * 20000.0) as i16
+        };
+        // Right: stays quiet the whole time -- independently, its own
+        // psychoacoustic model should have no reason to leave `Long`.
+        let right = (0.01 * libm::sinf(i as f32 * 0.5) * 20000.0) as i16;
+        interleaved[i * 2] = left;
+        interleaved[i * 2 + 1] = right;
     }
+
+    let mut out = Vec::new();
+    let mut frame_offset = 0usize;
+    for (i, chunk) in interleaved.chunks(1152 * 2).enumerate() {
+        let pcm =
+            PcmBuffer::from_i16_interleaved(chunk, ChannelMode::JointStereoMs, MpegVersion::Mpeg1)
+                .expect("PCM buffer");
+        let written = encoder
+            .encode_frame(&pcm, &mut out)
+            .expect("encode_frame must not error on divergent-channel content");
+        assert!(
+            written == 417 || written == 418,
+            "frame {i}: unexpected size {written} (expected 417 or 418 for 128 kbps/44.1 kHz)"
+        );
+
+        let header = u32::from_be_bytes([
+            out[frame_offset],
+            out[frame_offset + 1],
+            out[frame_offset + 2],
+            out[frame_offset + 3],
+        ]);
+        assert_eq!(header >> 21, 0x7FF, "frame {i}: invalid syncword");
+        frame_offset += written;
+    }
+    assert_eq!(out.len(), frame_offset);
+    assert_eq!(n_frames, 10, "sanity check on the loop bound assumed above");
 }
 
 /// Found during the M9 review: `Encoder::new`'s own doc comment already

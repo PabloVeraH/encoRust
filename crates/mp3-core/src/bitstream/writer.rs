@@ -77,6 +77,58 @@ impl<'a> BitWriter<'a> {
             self.bits_in_buffer = 0;
         }
     }
+
+    /// Total bits written so far, *before* any padding `flush` would add.
+    /// Lets a caller capture a section's exact bit length (e.g. one
+    /// granule's scalefactors or Huffman data) while it's still being
+    /// accumulated in its own scratch `BitWriter`, so that length can
+    /// later be spliced bit-exactly into a different, ongoing bitstream
+    /// via [`Self::write_raw_bits`] — see that method's doc comment for
+    /// why exactness (not the flushed, byte-rounded length) matters.
+    #[must_use]
+    pub fn bit_len(&self) -> usize {
+        self.out.len() * 8 + self.bits_in_buffer as usize
+    }
+
+    /// Appends exactly `n_bits` from `bytes` (MSB-first, starting at bit 0
+    /// of `bytes[0]`) onto this writer's own bit position.
+    ///
+    /// Unlike `out.extend_from_slice(bytes)`, this does not require
+    /// `bytes` to already be aligned to this writer's current bit
+    /// position, and — critically — it does not carry over any padding
+    /// a separate `flush()` on the *source* of `bytes` added beyond its
+    /// true `n_bits`. Real MP3 `main_data` packs scalefactors and
+    /// Huffman data for every granule/channel as one continuous bit
+    /// stream with **no** byte-alignment between sections (only the
+    /// start of `main_data` itself is byte-aligned); splicing
+    /// independently-flushed, byte-padded scratch buffers together with
+    /// a plain byte copy inserts up to 7 spurious padding bits at every
+    /// section boundary, which desyncs a real decoder's bit-exact parse
+    /// from that point on. This method is how a per-section scratch
+    /// `BitWriter` (flushed for convenience, so its content is
+    /// byte-readable) gets appended to a shared, continuously-packed
+    /// bitstream without introducing that gap. See
+    /// `docs/mp3-encoder/11-phase8-bitstream-multiplexing.md` §1 and the
+    /// gain/corruption bug this fixes in `docs/investigation-log.md`'s
+    /// investigation notes.
+    ///
+    /// # Panics
+    ///
+    /// Panics (via slice indexing) if `bytes` has fewer than
+    /// `n_bits.div_ceil(8)` bytes.
+    pub fn write_raw_bits(&mut self, bytes: &[u8], n_bits: usize) {
+        let mut remaining = n_bits;
+        let mut byte_idx = 0;
+        while remaining >= 8 {
+            self.write_bits(u32::from(bytes[byte_idx]), 8);
+            byte_idx += 1;
+            remaining -= 8;
+        }
+        if remaining > 0 {
+            let value = u32::from(bytes[byte_idx]) >> (8 - remaining);
+            self.write_bits(value, remaining as u8);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -139,6 +191,48 @@ mod tests {
         w.write_bits(0b1, 1);
         w.flush();
         assert_eq!(out, [0b1000_0000]);
+    }
+
+    #[test]
+    fn bit_len_reflects_unpadded_bit_count() {
+        let mut out = Vec::new();
+        let mut w = BitWriter::new(&mut out);
+        assert_eq!(w.bit_len(), 0);
+        w.write_bits(0b101, 3);
+        assert_eq!(w.bit_len(), 3);
+        w.write_bits(0xFF, 8);
+        assert_eq!(w.bit_len(), 11);
+    }
+
+    #[test]
+    fn write_raw_bits_splices_without_source_flush_padding() {
+        // Source section: 5 bits ("10110"), flushed (byte-padded with 3
+        // zero bits it never had). If those padding bits leaked into the
+        // splice, the reader below would see 8 bits instead of 5 for this
+        // section and misalign everything that follows -- exactly the
+        // per-granule desync this method exists to prevent.
+        let mut src_buf = Vec::new();
+        let mut src = BitWriter::new(&mut src_buf);
+        src.write_bits(0b10110, 5);
+        let src_bits = src.bit_len();
+        src.flush();
+        assert_eq!(src_bits, 5);
+        assert_eq!(src_buf, [0b1011_0000]); // 5 real bits + 3 flush-padding bits
+
+        // Destination: not byte-aligned when the splice starts.
+        let mut out = Vec::new();
+        let mut dst = BitWriter::new(&mut out);
+        dst.write_bits(0b11, 2); // 2 bits already pending
+        dst.write_raw_bits(&src_buf, src_bits); // splice exactly 5 bits, not 8
+        dst.write_bits(0b1, 1); // one more bit to prove position tracking
+        dst.flush();
+
+        // Expected bit sequence: "11" + "10110" + "1" = "11101101" --
+        // exactly one byte, with nothing left for `flush` to pad. A
+        // byte-copy of the flushed source (8 bits, padding included)
+        // would have produced 10 bits total instead, spilling into a
+        // second byte.
+        assert_eq!(out, [0b1110_1101]);
     }
 
     #[test]

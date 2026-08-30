@@ -5,7 +5,7 @@
 //! Allocation-free on the hot path: all working buffers are fixed-size
 //! stack arrays. Partition data (which depends only on sample_rate_hz,
 //! a constant for the encoder's lifetime) is pre-computed once and cached
-//! — see `docs/mejoras.md` §3.2, M-1 and M-2.
+//! — see `docs/investigation-log.md` §3.2, M-1 and M-2.
 
 use crate::mdct::BlockType;
 
@@ -13,7 +13,7 @@ use super::fft::fft_windowed_complex;
 use super::tables::{
     absolute_threshold_db, compute_partition_map, partition_bark_centers, partition_hz_centers,
     scalefactor_sample_rate_index, spreading_db, NMT_DB, SFB_LONG_BOUNDARIES, SFB_LONG_COUNTS,
-    TMN_DB,
+    SFB_SHORT_BOUNDARIES, SFB_SHORT_COUNTS, SPL_TO_DBFS_OFFSET_DB, TMN_DB,
 };
 
 // `no_std`-safe transcendental functions -- call as free functions, never
@@ -21,7 +21,7 @@ use super::tables::{
 // inherent `f32` methods that don't exist under `core`. See
 // `docs/mp3-encoder/verification/manifest.yaml`'s build-wasm note.
 use libm::{
-    atan2f as atan2, ceilf as ceil, cosf as cos, expf as exp, floorf as floor, log10f as log10,
+    atan2f as atan2, ceilf as ceil, cosf as cos, expf as exp, floorf as floor, log2f as log2,
     sqrtf as sqrt,
 };
 
@@ -42,9 +42,48 @@ const FFT_BINS_LONG: usize = FFT_SIZE_LONG / 2 + 1;
 /// yields ~48 partitions for 44.1 kHz; 64 is a safe upper bound.
 const MAX_PARTITIONS: usize = 64;
 
-/// Perceptual entropy transient detection threshold (dB increase over
-/// filtered PE). Tuning parameter — see chapter 07 §5.
-const PE_ATTACK_THRESHOLD_DB: f32 = 10.0;
+/// Perceptual entropy transient detection threshold, in dB increase of
+/// the current granule's PE over the smoothed recent baseline.
+///
+/// Despite the name, this used to be compared directly against the raw
+/// (non-dB) `pe_ratio` (`pe_ratio > 10.0`, i.e. requiring a 10x jump) —
+/// harmless by itself as just a very strict threshold, but compounded
+/// with `compute_perceptual_entropy`'s own bug (see that function's doc
+/// comment) into transient detection that could never fire on real
+/// audio at all. With that formula fixed, `pe_ratio` was measured
+/// (chickens_16bit.wav, a real recording with sharp attacks) sitting at
+/// 0.46-1.4x for ordinary content and reaching 2.1-5.7x at genuine
+/// attacks.
+///
+/// A *continuously-advancing* pure sine tone (see `make_tone_at`) still
+/// showed ~2.8x (≈4.5 dB) frame-to-frame PE variation on its own,
+/// despite being genuinely stationary -- windowed FFT bins near, but
+/// not exactly on, the tone's frequency pick up spectral leakage whose
+/// magnitude/phase don't evolve as linearly frame-to-frame as the
+/// dominant bin's does, which `compute_tonality`'s linear-prediction
+/// model reads as some unpredictability even for a pure tone. 5 dB
+/// (~3.5x) clears that synthetic-tone noise floor while still catching
+/// real content's clearer attacks (the 5.7x case above); it will miss
+/// softer ones (the 2.1x case) -- a real limitation, not a false
+/// negative introduced by this fix, since nothing triggered before it
+/// at all. The comparison now actually converts to dB (`10*log10(ratio)`)
+/// to match this constant's name and unit instead of comparing a
+/// dB-labeled constant against a raw ratio.
+const PE_ATTACK_THRESHOLD_DB: f32 = 5.0;
+
+/// Granules to treat as baseline-seeding only, never a transient
+/// candidate, before `decide_block_type` starts comparing `pe_ratio`.
+/// Matches `history`'s 2-frame depth: `compute_tonality`'s
+/// unpredictability measure needs both slots populated by real (not
+/// initial-zero) spectra to produce a stable estimate, otherwise its
+/// output swings between the first couple of calls regardless of how
+/// stationary the actual signal is -- see `granules_seen`'s doc comment.
+const PE_WARMUP_GRANULES: u8 = 2;
+
+/// `10 / log2(10)`, for converting a ratio's `log2` (this module's
+/// available transcendental function) to decibels without a separate
+/// `log10`: `10*log10(x) = 10 * log2(x)/log2(10) = log2(x) * DB_PER_LOG2`.
+const DB_PER_LOG2: f32 = 3.0103;
 
 /// Low-pass filter coefficient for smoothed PE history.
 const PE_SMOOTH_COEFF: f32 = 0.3;
@@ -132,10 +171,37 @@ impl PartitionCache {
 /// Signal-to-mask ratio per scalefactor band for one granule/channel.
 #[derive(Debug, Clone, Copy)]
 pub struct ScalefactorBandSmr {
-    /// SMR per scalefactor band, in energy ratio (not dB).
-    /// Sized for the maximum long-block band count (22 bands).
-    /// Bands beyond the sample rate's actual count are set to 1.0.
+    /// SMR per *long*-block scalefactor band, in energy ratio (not dB).
+    /// Sized for the maximum long-block band count (22 bands). Bands
+    /// beyond the sample rate's actual count are set to 1.0. Applies to
+    /// `BlockType::Long`/`Start`/`Stop` granules -- all three are
+    /// long-block-shaped (576 lines, no window subdivision), so they
+    /// share this grid.
     pub bands: [f32; 22],
+
+    /// SMR per *short*-block scalefactor band, for `BlockType::Short`
+    /// granules. Sized for the short-block band count, which is a fixed
+    /// 13 across every supported sample rate (see `SFB_SHORT_COUNTS`).
+    /// One value per band, shared across all 3 windows within the
+    /// granule -- matches `quantize::loop_control::build_band_map`'s
+    /// current per-flat-band granularity for short blocks (all 3
+    /// windows of a given band already collapse onto one scalefactor
+    /// and one distortion check there), not a per-window-of-3
+    /// refinement; that would need `build_band_map` and the scalefactor
+    /// storage to become window-aware too; out of scope here.
+    ///
+    /// This field exists because reusing `bands` (the long-block grid)
+    /// for short-block distortion checks compares each short scalefactor
+    /// band against a masking threshold computed for a *different*
+    /// frequency range -- `SFB_LONG_BOUNDARIES` and `SFB_SHORT_BOUNDARIES`
+    /// don't line up index-for-index. See `docs/investigation-log.md` §11's
+    /// "still open" note and `build_band_map`'s own doc comment for the
+    /// bug this fixes: the outer loop's per-band distortion ceiling was
+    /// silently keyed to the wrong band grid for every transient
+    /// (short-block) granule, which is exactly when the psychoacoustic
+    /// model's per-band precision matters most (limiting how far
+    /// quantization noise spreads in time -- pre-echo).
+    pub short_bands: [f32; 13],
 }
 
 // ---------------------------------------------------------------------------
@@ -156,8 +222,22 @@ pub struct PsychoacousticModel {
     /// Smoothed perceptual entropy baseline.
     smoothed_pe: f32,
 
-    /// Whether `smoothed_pe` has been seeded.
-    pe_initialized: bool,
+    /// Granules seen so far, capped at `PE_WARMUP_GRANULES` once reached.
+    /// `compute_tonality`'s unpredictability measure needs 2 full frames
+    /// of real (non-initial-zero) history to produce a stable estimate;
+    /// before that, `history`'s still-zeroed slots make tonality swing
+    /// from its typical steady-state value, which in turn swings
+    /// `part_threshold` (see `analyze_granule` Step 6) and so
+    /// `compute_perceptual_entropy`'s output — a spurious one-time PE
+    /// spike on the granule where history first becomes "mostly real",
+    /// with nothing actually transient in the audio. `decide_block_type`
+    /// treats every granule while this counter is below
+    /// `PE_WARMUP_GRANULES` as baseline-seeding only, never a candidate
+    /// transient, so that warm-up spike can't trigger a false Start --
+    /// confirmed via `stationary_tone_stays_long_after_initial_settle`,
+    /// which failed against a genuinely unchanging tone before this
+    /// counter existed.
+    granules_seen: u8,
 
     /// Current block type state machine output.
     block_type: BlockType,
@@ -182,7 +262,7 @@ impl PsychoacousticModel {
             history: [[Complex { re: 0.0, im: 0.0 }; FFT_BINS_LONG]; 2],
             partitions: None,
             smoothed_pe: 0.0,
-            pe_initialized: false,
+            granules_seen: 0,
             block_type: BlockType::Long,
             short_count: 0,
         }
@@ -311,10 +391,44 @@ impl PsychoacousticModel {
             }
         }
 
+        // Step 7b: Map the *same* per-partition SMR to short-block
+        // scalefactor bands too (see `ScalefactorBandSmr::short_bands`'s
+        // doc comment for why this parallel mapping exists). One short
+        // window is 192 lines (32 subbands × 6 lines each -- see
+        // `Encoder::mdct_stage`'s `BlockType::Short` branch), a third of
+        // the long-block granule's 576, so the line→Hz scale is `192`
+        // here, not `576`.
+        let sfb_s_count = SFB_SHORT_COUNTS[sfb_idx];
+        let sfb_s_bounds = &SFB_SHORT_BOUNDARIES[sfb_idx];
+        let mut sfb_smr_short = [1.0f32; 13];
+        for sfb in 0..sfb_s_count {
+            let start_line = sfb_s_bounds[sfb];
+            let end_line = sfb_s_bounds[sfb + 1];
+
+            let start_freq = start_line as f32 * sample_rate_hz as f32 / (2.0 * 192.0);
+            let end_freq = end_line as f32 * sample_rate_hz as f32 / (2.0 * 192.0);
+            let start_bin = floor(start_freq / freq_per_bin) as usize;
+            let end_bin = (ceil(end_freq / freq_per_bin) as usize).min(FFT_BINS_LONG - 1);
+
+            if end_bin > start_bin {
+                let mut visited = [false; MAX_PARTITIONS];
+                for &p in &partitions.partition_of_bin[start_bin..end_bin] {
+                    let p = p as usize;
+                    if p < visited.len() && !visited[p] {
+                        visited[p] = true;
+                        if part_smr[p] > sfb_smr_short[sfb] {
+                            sfb_smr_short[sfb] = part_smr[p];
+                        }
+                    }
+                }
+            }
+        }
+
         // Step 8: Perceptual entropy + block-type decision
         let pe = self.compute_perceptual_entropy(
-            &mag,
-            &partitions.partition_of_bin,
+            &part_energy,
+            &part_threshold,
+            &part_tonality_count,
             partitions.num_partitions,
         );
         self.decide_block_type(pe);
@@ -328,7 +442,13 @@ impl PsychoacousticModel {
             };
         }
 
-        (ScalefactorBandSmr { bands: sfb_smr }, self.block_type)
+        (
+            ScalefactorBandSmr {
+                bands: sfb_smr,
+                short_bands: sfb_smr_short,
+            },
+            self.block_type,
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -388,32 +508,44 @@ impl PsychoacousticModel {
         }
     }
 
-    /// Compute perceptual entropy from the FFT magnitude spectrum.
+    /// Compute perceptual entropy: how many bits' worth of *audible*
+    /// (above-masking-threshold) information this granule carries,
+    /// weighted by each partition's bandwidth. A sudden rise relative to
+    /// the smoothed recent baseline (`decide_block_type`) signals a
+    /// transient -- the masking model's steady-state assumptions
+    /// momentarily broke down, which is exactly when window-switching to
+    /// short blocks limits how far quantization noise can spread in
+    /// time (pre-echo).
+    ///
+    /// Takes the granule's *real* per-partition energy and masking
+    /// threshold (already computed in `analyze_granule` -- spreading
+    /// function, tonality-weighted SNR, and the ATH floor all folded
+    /// in), not a re-derivation from raw FFT magnitudes. An earlier
+    /// version computed its own "threshold" as `energy_per_bin * 1e-6`
+    /// -- the *same* bin's own energy, just scaled -- which made
+    /// `energy_per_bin / thr` collapse to the constant `1e6` for every
+    /// partition with any energy at all, regardless of the signal's
+    /// actual shape. That made `pe` track only how many partitions had
+    /// nonzero energy (essentially constant for any full-spectrum
+    /// signal), never how audible or transient the content actually
+    /// was -- so `decide_block_type`'s `pe_ratio` never moved enough to
+    /// cross `PE_ATTACK_THRESHOLD_DB`, and short blocks could never
+    /// trigger on real audio (confirmed empirically: 0 of 3360 granules
+    /// on a real, percussive recording). See `docs/investigation-log.md`'s
+    /// gain-bug investigation notes.
     fn compute_perceptual_entropy(
         &self,
-        mag: &[f32; FFT_BINS_LONG],
-        partition_of_bin: &[u8; FFT_BINS_LONG],
+        part_energy: &[f32; MAX_PARTITIONS],
+        part_threshold: &[f32; MAX_PARTITIONS],
+        part_count: &[usize; MAX_PARTITIONS],
         num_partitions: usize,
     ) -> f32 {
-        let mut part_energy = [0.0f32; MAX_PARTITIONS];
-        let mut part_count = [0usize; MAX_PARTITIONS];
-
-        for i in 0..FFT_BINS_LONG {
-            let p = partition_of_bin[i] as usize;
-            if p < MAX_PARTITIONS {
-                part_energy[p] += mag[i] * mag[i];
-                part_count[p] += 1;
-            }
-        }
-
         let num_p = num_partitions.min(MAX_PARTITIONS);
         let mut pe = 0.0f32;
         for p in 0..num_p {
-            if part_count[p] > 0 && part_energy[p] > 0.0 {
+            if part_count[p] > 0 && part_threshold[p] > 0.0 && part_energy[p] > part_threshold[p] {
                 let bw = part_count[p] as f32;
-                let energy_per_bin = part_energy[p] / bw;
-                let thr = energy_per_bin * 1e-6 + 1e-30;
-                pe += bw * log10(energy_per_bin / thr + 1.0);
+                pe += bw * log2(part_energy[p] / part_threshold[p]);
             }
         }
 
@@ -422,20 +554,29 @@ impl PsychoacousticModel {
 
     /// Block-type state machine based on perceptual entropy transients.
     fn decide_block_type(&mut self, pe: f32) {
-        if !self.pe_initialized {
-            self.smoothed_pe = pe;
-            self.pe_initialized = true;
+        if self.granules_seen < PE_WARMUP_GRANULES {
+            self.granules_seen += 1;
+            self.smoothed_pe = if self.granules_seen == 1 {
+                pe
+            } else {
+                PE_SMOOTH_COEFF * pe + (1.0 - PE_SMOOTH_COEFF) * self.smoothed_pe
+            };
             return;
         }
 
         let baseline = self.smoothed_pe.max(PE_BASELINE_FLOOR);
         let pe_ratio = pe / baseline;
+        let pe_ratio_db = if pe_ratio > 0.0 {
+            log2(pe_ratio) * DB_PER_LOG2
+        } else {
+            f32::NEG_INFINITY
+        };
 
         self.smoothed_pe = PE_SMOOTH_COEFF * pe + (1.0 - PE_SMOOTH_COEFF) * self.smoothed_pe;
 
         match self.block_type {
             BlockType::Long => {
-                if pe_ratio > PE_ATTACK_THRESHOLD_DB {
+                if pe_ratio_db > PE_ATTACK_THRESHOLD_DB {
                     self.block_type = BlockType::Start;
                     self.short_count = 3;
                 }
@@ -461,10 +602,16 @@ impl PsychoacousticModel {
 // ---------------------------------------------------------------------------
 
 fn ath_from_db(db: f32) -> f32 {
-    if db < -100.0 {
+    // `db` is dB SPL (Annex D's absolute-threshold-of-hearing curve).
+    // Every energy value elsewhere in this model is computed from PCM
+    // normalized to [-1.0, 1.0] (0 dBFS = 1.0, unity linear power), not
+    // absolute SPL -- see `SPL_TO_DBFS_OFFSET_DB`'s doc comment for why
+    // re-anchoring to that reference before exponentiating matters.
+    let db_fs = db - SPL_TO_DBFS_OFFSET_DB;
+    if db_fs < -240.0 {
         return 1e-20;
     }
-    exp(db * LN10_OVER_10)
+    exp(db_fs * LN10_OVER_10)
 }
 
 // ---------------------------------------------------------------------------
@@ -472,7 +619,7 @@ fn ath_from_db(db: f32) -> f32 {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)] // f32::abs() in test assertions -- see docs/mejoras.md §7 item 6
+#[allow(clippy::disallowed_methods)] // f32::abs() in test assertions -- see docs/investigation-log.md §7 item 6
 mod tests {
     use super::*;
     use alloc::vec;
@@ -481,20 +628,60 @@ mod tests {
     use libm::sinf as sin;
 
     fn make_tone(freq: f32, sample_rate: u32, num_samples: usize) -> Vec<f32> {
+        make_tone_at(freq, sample_rate, num_samples, 0)
+    }
+
+    /// Like `make_tone`, but starting at time `start_sample / sample_rate`
+    /// instead of always t=0. Needed for any test that calls
+    /// `analyze_granule` more than once and wants each call to represent
+    /// the *next* chunk of one continuous signal: `compute_tonality`
+    /// linearly extrapolates each FFT bin's magnitude and phase from the
+    /// previous two frames, which is only a meaningful predictor if the
+    /// frames actually advance in time the way real, continuously
+    /// sampled audio does. Calling `make_tone` repeatedly (always t=0)
+    /// instead feeds the *identical* window every time, which has zero
+    /// phase evolution between calls -- not "maximally stationary" from
+    /// the predictor's perspective, but a discontinuity from what it's
+    /// designed to predict, producing spurious unpredictability
+    /// (confirmed empirically: `stationary_tone_stays_long_after_
+    /// initial_settle` failed against a repeated-window tone regardless
+    /// of how many warm-up calls `decide_block_type` was given, until
+    /// switched to this continuously-advancing generator).
+    fn make_tone_at(
+        freq: f32,
+        sample_rate: u32,
+        num_samples: usize,
+        start_sample: usize,
+    ) -> Vec<f32> {
         let mut samples = Vec::with_capacity(num_samples);
         for i in 0..num_samples {
-            let t = i as f32 / sample_rate as f32;
+            let t = (start_sample + i) as f32 / sample_rate as f32;
             samples.push(sin(2.0 * PI * freq * t));
         }
         samples
     }
 
     fn make_noise(num_samples: usize) -> Vec<f32> {
+        // xorshift32, not the LCG this used to be: an LCG's low-order
+        // bits are famously weak, but even reading only its high bits
+        // (as the earlier version did) doesn't fix a subtler issue this
+        // test actually hit -- an LCG's output has real spectral
+        // structure (a shallow low-frequency bias in this case), which
+        // isn't "broadband noise" in the sense this test needs. That
+        // bias was invisible while `ath_from_db` (see model2.rs) was
+        // miscalibrated ~96 dB too high, since the inflated ATH floor
+        // pinned nearly every partition's SMR to the same 1.0 floor
+        // regardless of the signal's actual spectral shape; fixing that
+        // calibration made this test signal's own bias visible for the
+        // first time, not the calibration fix wrong. xorshift32 has
+        // markedly better spectral flatness for this size of sample.
+        let mut state: u32 = 0x9E37_79B9;
         let mut samples = Vec::with_capacity(num_samples);
-        let mut seed: u32 = 12345;
         for _ in 0..num_samples {
-            seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
-            samples.push(((seed >> 16) as f32 / 32768.0 - 0.5) * 2.0);
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            samples.push((state as f32 / u32::MAX as f32) * 2.0 - 1.0);
         }
         samples
     }
@@ -523,6 +710,68 @@ mod tests {
         for (i, &s) in smr.bands.iter().enumerate().take(22) {
             assert!(s >= 1.0, "SMR band {i} is {s}, should be >= 1.0");
         }
+    }
+
+    #[test]
+    fn smr_short_bands_tone_produces_high_smr_near_own_frequency() {
+        // Mirrors `smr_tone_produces_high_smr_at_own_frequency`, but for
+        // the short-block grid this fix adds (`short_bands`) -- guards
+        // against the bug docs/investigation-log.md §11 describes: `short_bands`
+        // used to not exist at all, so `quantize_granule` compared
+        // short-block distortion against `bands` (a masking profile
+        // keyed to the *long*-block frequency-to-band mapping).
+        let mut model = make_model(44100);
+        let tone = make_tone(1000.0, 44100, 1024);
+        let (smr, _bt) = model.analyze_granule(&tone, 44100);
+
+        let has_high_smr = smr.short_bands.iter().any(|&s| s > 2.0);
+        assert!(
+            has_high_smr,
+            "tone should produce short-block SMR > 1.0 in some bands, got {:?}",
+            smr.short_bands
+        );
+
+        for (i, &s) in smr.short_bands.iter().enumerate() {
+            assert!(s >= 1.0, "short SMR band {i} is {s}, should be >= 1.0");
+        }
+    }
+
+    #[test]
+    fn smr_short_bands_peak_falls_in_the_tones_own_frequency_range() {
+        // Correctness check for Step 7b's line->Hz conversion (`* 192`
+        // scale, not `* 576`): the short-block band with the highest SMR
+        // for a pure tone should be the one whose own
+        // `SFB_SHORT_BOUNDARIES` range, converted to Hz with the *same*
+        // formula `analyze_granule` uses, actually contains the tone's
+        // frequency. A wrong scale (e.g. accidentally reusing the
+        // long-block `/576` divisor) would shift every band's Hz range
+        // and make this fail even though `short_bands` itself would
+        // still look superficially plausible (finite, some band > 1.0).
+        const SAMPLE_RATE: u32 = 44100;
+        const TONE_HZ: f32 = 6000.0;
+
+        let mut model = make_model(SAMPLE_RATE);
+        let tone = make_tone(TONE_HZ, SAMPLE_RATE, 1024);
+        let (smr, _bt) = model.analyze_granule(&tone, SAMPLE_RATE);
+
+        let sfb_idx = scalefactor_sample_rate_index(SAMPLE_RATE);
+        let bounds = &SFB_SHORT_BOUNDARIES[sfb_idx];
+        let count = SFB_SHORT_COUNTS[sfb_idx];
+
+        let (peak_band, _) = smr.short_bands[..count]
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap();
+
+        let start_hz = bounds[peak_band] as f32 * SAMPLE_RATE as f32 / (2.0 * 192.0);
+        let end_hz = bounds[peak_band + 1] as f32 * SAMPLE_RATE as f32 / (2.0 * 192.0);
+        assert!(
+            (start_hz..end_hz).contains(&TONE_HZ),
+            "peak short band {peak_band} spans {start_hz}-{end_hz} Hz, \
+             doesn't contain the {TONE_HZ} Hz tone -- short-block Hz \
+             conversion scale looks wrong"
+        );
     }
 
     #[test]
@@ -628,11 +877,20 @@ mod tests {
 
     #[test]
     fn stationary_tone_stays_long_after_initial_settle() {
+        // Each call represents the *next* chunk of one continuous tone
+        // (hop = 576, matching the real 1152-sample-frame/2-granule
+        // encoder pipeline in encoder.rs), not a repeated, non-advancing
+        // window -- see `make_tone_at`'s doc comment for why that
+        // distinction matters to the tonality predictor this exercises.
         let mut model = make_model(44100);
-        let tone = make_tone(440.0, 44100, 1024);
-        model.analyze_granule(&tone, 44100);
+        const HOP: usize = 576;
+        for i in 0..PE_WARMUP_GRANULES as usize {
+            let tone = make_tone_at(440.0, 44100, 1024, i * HOP);
+            model.analyze_granule(&tone, 44100);
+        }
 
-        for _ in 0..10 {
+        for i in PE_WARMUP_GRANULES as usize..PE_WARMUP_GRANULES as usize + 10 {
+            let tone = make_tone_at(440.0, 44100, 1024, i * HOP);
             let (_, bt) = model.analyze_granule(&tone, 44100);
             assert_eq!(
                 bt,
@@ -701,5 +959,67 @@ mod tests {
             assert!(smr1.bands[i].is_finite());
             assert!(smr2.bands[i].is_finite());
         }
+    }
+
+    #[test]
+    #[allow(clippy::needless_range_loop)]
+    fn lookahead_window_changes_smr_vs_zero_padding_on_transient() {
+        // Verifies that feeding the psychoacoustic model a 1024-sample
+        // window with real look-back context produces different SMR
+        // values than zero-padded windows on a signal with a sharp
+        // transient. Zero-padding introduces spectral leakage at the
+        // FFT discontinuity that distorts SMR — this test confirms the
+        // look-back window changes the model's output for the same
+        // granule samples.
+        let sample_rate = 44100u32;
+
+        // Signal: quiet → sudden loud tone (attack at sample 512)
+        let mut signal = vec![0.0f32; 1024];
+        for i in 0..512 {
+            signal[i] = 0.01 * sin(i as f32 * 0.5);
+        }
+        for i in 512..1024 {
+            signal[i] = 0.8 * sin((i as f32) * 1.2);
+        }
+
+        // Model with zero-padding: window[0..576] = granule, rest zeros
+        let mut model_zp = make_model(sample_rate);
+        for _ in 0..3 {
+            model_zp.analyze_granule(&[0.0; 1024], sample_rate);
+        }
+        let mut zp_window = [0.0f32; 1024];
+        zp_window[..576].copy_from_slice(&signal[..576]);
+        let (smr_zp, _) = model_zp.analyze_granule(&zp_window, sample_rate);
+
+        // Model with look-back: window[0..448] = prev.context, window[448..]=granule
+        let mut model_lb = make_model(sample_rate);
+        for _ in 0..3 {
+            model_lb.analyze_granule(&[0.0; 1024], sample_rate);
+        }
+        let mut lb_window = [0.0f32; 1024];
+        // Simulate 448-sample look-back from a previous frame (varied,
+        // not identical to zeros — use the end of the signal for realism)
+        lb_window[..448].copy_from_slice(&signal[576..1024]);
+        lb_window[448..].copy_from_slice(&signal[..576]);
+        let (smr_lb, _) = model_lb.analyze_granule(&lb_window, sample_rate);
+
+        // Count how many bands differ — a properly different window
+        // should produce a different SMR profile.
+        let mut diff_count = 0usize;
+        let mut max_rel_diff = 0.0f32;
+        for b in 0..22 {
+            let d = (smr_zp.bands[b] - smr_lb.bands[b]).abs();
+            let rel = d / smr_zp.bands[b].max(smr_lb.bands[b]).max(1.0);
+            if rel > 0.01 {
+                diff_count += 1;
+            }
+            max_rel_diff = max_rel_diff.max(rel);
+        }
+
+        assert!(
+            diff_count > 0 || max_rel_diff > 0.01,
+            "SMR with look-back and zero-padding should differ on transient \
+             (diff_count={diff_count}, max_rel_diff={max_rel_diff})"
+        );
     }
 }
