@@ -14,7 +14,7 @@ use crate::quantize::scalefactors::ScaleFactors;
 // f32::abs() is std-only under this crate's MSRV (1.82) when built
 // `--no-default-features` for wasm32 — pre-existing latent breakage,
 // invisible until `rust-toolchain.toml` pinned a real 1.82 build (see
-// docs/mejoras.md's review notes). Use libm::fabsf, same as every other
+// docs/investigation-log.md's review notes). Use libm::fabsf, same as every other
 // transcendental function in this crate.
 use libm::{fabsf, powf};
 
@@ -357,7 +357,7 @@ const MAX_STEP: i32 = MAX_GLOBAL_GAIN as i32 - GLOBAL_GAIN_BIAS as i32;
 /// scalefactor amplification could (`quantize_granule`'s outer loop),
 /// and its own iteration cap isn't remotely enough to cover the gap.
 /// Searching the *full* valid range removes the need to guess a correct
-/// starting point at all. See `docs/mejoras.md`'s gain-bug investigation
+/// starting point at all. See `docs/investigation-log.md`'s gain-bug investigation
 /// notes for how this was diagnosed (empirically, via ffmpeg/symphonia
 /// differential decoding against real recordings, not just this crate's
 /// own self-consistent quantize/dequantize round-trip).
@@ -427,6 +427,30 @@ fn inner_loop(
 // Public entry point
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Diagnostic-only bypass (docs/investigation-log.md §11, "Where the next session
+// should start", step 1) -- isolates whether the ~0 sample-correlation
+// fidelity bug lives upstream (filterbank/MDCT/mdct_prev_tail) or
+// downstream (this module's inner/outer loop interaction) of
+// `quantize_granule`. When armed, `quantize_granule` skips its own
+// search entirely and quantizes at a caller-chosen, fixed `step` with
+// scalefac forced to all-zero -- no adaptive precision-maximization, no
+// SMR-driven amplification. `#[cfg(test)]`-gated: compiled only for
+// `mp3-core`'s own unit-test binary, never present in a release build or
+// visible to other crates. See `Encoder`'s `diag_bypass_quantizer_pure_tone`
+// test for the harness that uses this.
+#[cfg(test)]
+thread_local! {
+    static DEBUG_FIXED_STEP: core::cell::Cell<Option<f32>> = const { core::cell::Cell::new(None) };
+}
+
+/// Arms (`Some(step)`) or disarms (`None`) the fixed-step bypass for the
+/// calling thread. See the module-level comment above this function.
+#[cfg(test)]
+pub fn set_debug_fixed_step(step: Option<f32>) {
+    DEBUG_FIXED_STEP.with(|cell| cell.set(step));
+}
+
 /// Runs the inner (rate) loop nested inside the outer (distortion) loop
 /// to quantize one granule's spectrum.
 ///
@@ -443,6 +467,35 @@ pub fn quantize_granule(
     sample_rate_hz: u32,
 ) -> QuantizationResult {
     let sfb_idx = scalefactor_sample_rate_index(sample_rate_hz);
+
+    #[cfg(test)]
+    if let Some(step) = DEBUG_FIXED_STEP.with(core::cell::Cell::get) {
+        let band_of_line = build_band_map(sfb_idx, block_type);
+        let scalefac = [0u8; 39];
+        let mut ix = [0i32; 576];
+        let mut sign = [false; 576];
+        quantize_spectrum(
+            spectrum,
+            step,
+            &band_of_line,
+            &scalefac,
+            false,
+            &mut ix,
+            &mut sign,
+        );
+        let gg = (step as i32 + GLOBAL_GAIN_BIAS as i32).clamp(0, MAX_GLOBAL_GAIN as i32) as u8;
+        return QuantizationResult {
+            ix,
+            sign,
+            scalefac: ScaleFactors { values: scalefac },
+            global_gain: gg,
+            scalefac_scale: false,
+            preflag: false,
+            subblock_gain: None,
+            converged: true,
+        };
+    }
+
     let band_of_line = build_band_map(sfb_idx, block_type);
     let num_bands = band_count_for(sfb_idx, block_type);
 
@@ -499,7 +552,7 @@ pub fn quantize_granule(
         // *same* stationary tone could saturate by different amounts,
         // producing audible amplitude modulation on content a
         // reference encoder (LAME) reconstructs with ~1.0 sample
-        // correlation to the original. See docs/mejoras.md's
+        // correlation to the original. See docs/investigation-log.md's
         // gain/corruption investigation notes for how this was
         // diagnosed (differential correlation against LAME's own
         // encode of the same material, not just this crate's internal
@@ -513,11 +566,51 @@ pub fn quantize_granule(
 
         let mut retry = false;
         for b in 0..num_bands {
-            let allowed = if smr.bands[b] > 1.0 {
-                (signal_e[b] + EPS) / smr.bands[b]
+            // Short blocks use their own band grid -- `smr.bands` is
+            // keyed to `SFB_LONG_BOUNDARIES`, a different frequency-to-
+            // band mapping than the short-block grid `band_of_line`
+            // just used to compute `signal_e`/`distort_e` above. See
+            // `ScalefactorBandSmr::short_bands`'s doc comment.
+            let smr_value = if block_type == BlockType::Short {
+                smr.short_bands[b]
             } else {
-                f32::MAX
+                smr.bands[b]
             };
+            // `allowed` is the band's masking threshold in energy terms
+            // (`signal_energy / SMR`, the standard formula) -- not
+            // special-cased for `smr_value <= 1.0`. The psychoacoustic
+            // model clamps every SMR value to `[1.0, 1e6]`
+            // (`model2.rs`'s `part_smr[p] = (...).clamp(1.0, 1e6)`, and
+            // both `sfb_smr`/`sfb_smr_short` default-init to `1.0`), so
+            // `smr_value` is always >= 1.0 -- no division-by-zero risk,
+            // and no case where this formula produces a *negative* or
+            // undefined threshold.
+            //
+            // An earlier version treated `smr_value <= 1.0` (which, given
+            // the clamp above, only ever means "exactly 1.0": a band the
+            // model found no real masking headroom for, or one that
+            // never got touched at all) as "no distortion ceiling at
+            // all" (`f32::MAX`). That's the right idea for a band that
+            // genuinely stands out from its neighbors, but broadband,
+            // flat-spectrum content (e.g. real noise, or noise-like
+            // transient material) legitimately produces SMR at-or-near
+            // 1.0 across *most or all* bands simultaneously -- no band
+            // stands out tonally, so the masking-ratio criterion has
+            // nothing to say, and this branch quietly disabled all
+            // per-band shaping for exactly that content. Confirmed
+            // empirically (docs/investigation-log.md §11, Session 5): on dense
+            // broadband noise, `global_gain` stayed pinned to one value
+            // for the *entire file* (457 of 460 granules identical) and
+            // `scalefac_compress` averaged less than half of LAME's on
+            // the same content -- i.e. almost no real per-band
+            // differentiation was happening, just one uniform global
+            // step repeated unchanged, which two independent decoders
+            // (ffmpeg and Symphonia) agreed reconstructs ~3.2% of samples
+            // louder than the source's own amplitude. Using the natural
+            // formula unconditionally still gives quiet/uniform bands a
+            // generous, but *finite*, ceiling (their own signal energy,
+            // when `smr_value == 1.0`) instead of an unconditional pass.
+            let allowed = (signal_e[b] + EPS) / smr_value;
 
             if distort_e[b] > allowed && scalefac[b] < MAX_SCALEFAC && !saturated[b] {
                 scalefac[b] += 1;
@@ -552,7 +645,7 @@ pub fn quantize_granule(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-// Scoped to `tests` only — see docs/mejoras.md §7 item 6.
+// Scoped to `tests` only — see docs/investigation-log.md §7 item 6.
 #[allow(clippy::needless_range_loop)]
 mod tests {
     use super::*;
@@ -884,6 +977,7 @@ mod tests {
 
         let mut smr = ScalefactorBandSmr {
             bands: [1.0f32; 22],
+            short_bands: [1.0f32; 13],
         };
         smr.bands[strict_band] = 1e5; // demands very low distortion
 
@@ -898,10 +992,58 @@ mod tests {
     }
 
     #[test]
+    fn outer_loop_short_block_uses_short_bands_not_long_bands() {
+        // Regression test for the short-block SMR grid-mismatch bug (see
+        // `ScalefactorBandSmr::short_bands`'s doc comment and
+        // `docs/investigation-log.md` §11): before this fix, `quantize_granule` had
+        // no `short_bands` field to read at all and consulted `bands`
+        // (the long-block grid) for every block type, including `Short`.
+        //
+        // `bands` and `short_bands` are set here to demand the *opposite*
+        // thing at the two competing bands under test -- this can only
+        // pass if the outer loop actually reads `short_bands` for a
+        // `Short` granule; reading `bands` instead would amplify
+        // `tolerant_band`, not `strict_band`, the reverse of what's
+        // asserted below.
+        let band_map = build_band_map(0, BlockType::Short);
+        let strict_band = band_map[5];
+        let tolerant_band = band_map[300];
+        assert_ne!(
+            strict_band, tolerant_band,
+            "test setup needs two distinct short scalefactor bands"
+        );
+
+        let mut spectrum = [0.0f32; 576];
+        for i in 5..10 {
+            spectrum[i] = 0.8;
+        }
+        for i in 300..305 {
+            spectrum[i] = 0.8;
+        }
+
+        let mut smr = ScalefactorBandSmr {
+            bands: [1.0f32; 22],
+            short_bands: [1.0f32; 13],
+        };
+        smr.bands[tolerant_band] = 1e5; // wrong-grid demand -- must be ignored for Short
+        smr.short_bands[strict_band] = 1e5; // right-grid demand -- must be honored
+
+        let result = quantize_granule(&spectrum, &smr, 60, BlockType::Short, 44100);
+        assert!(
+            result.scalefac.values[strict_band] > result.scalefac.values[tolerant_band],
+            "strict short band ({strict_band}) should get more scalefactor amplification \
+             than the tolerant one ({tolerant_band}): strict={}, tolerant={}",
+            result.scalefac.values[strict_band],
+            result.scalefac.values[tolerant_band]
+        );
+    }
+
+    #[test]
     fn outer_loop_uniform_smr_stays_low() {
         let spectrum = make_multitone();
         let smr = ScalefactorBandSmr {
             bands: [1.0f32; 22],
+            short_bands: [1.0f32; 13],
         };
 
         let result = quantize_granule(&spectrum, &smr, 1000, BlockType::Long, 44100);
@@ -931,6 +1073,7 @@ mod tests {
 
         let smr = ScalefactorBandSmr {
             bands: [1000.0f32; 22],
+            short_bands: [1000.0f32; 13],
         };
 
         let result = quantize_granule(&spectrum, &smr, 50, BlockType::Long, 44100);
@@ -979,6 +1122,7 @@ mod tests {
         let spectrum = [0.0f32; 576];
         let smr = ScalefactorBandSmr {
             bands: [1.0f32; 22],
+            short_bands: [1.0f32; 13],
         };
 
         let result = quantize_granule(&spectrum, &smr, 1000, BlockType::Long, 44100);

@@ -5,7 +5,7 @@
 //! Allocation-free on the hot path: all working buffers are fixed-size
 //! stack arrays. Partition data (which depends only on sample_rate_hz,
 //! a constant for the encoder's lifetime) is pre-computed once and cached
-//! — see `docs/mejoras.md` §3.2, M-1 and M-2.
+//! — see `docs/investigation-log.md` §3.2, M-1 and M-2.
 
 use crate::mdct::BlockType;
 
@@ -13,7 +13,7 @@ use super::fft::fft_windowed_complex;
 use super::tables::{
     absolute_threshold_db, compute_partition_map, partition_bark_centers, partition_hz_centers,
     scalefactor_sample_rate_index, spreading_db, NMT_DB, SFB_LONG_BOUNDARIES, SFB_LONG_COUNTS,
-    SPL_TO_DBFS_OFFSET_DB, TMN_DB,
+    SFB_SHORT_BOUNDARIES, SFB_SHORT_COUNTS, SPL_TO_DBFS_OFFSET_DB, TMN_DB,
 };
 
 // `no_std`-safe transcendental functions -- call as free functions, never
@@ -171,10 +171,37 @@ impl PartitionCache {
 /// Signal-to-mask ratio per scalefactor band for one granule/channel.
 #[derive(Debug, Clone, Copy)]
 pub struct ScalefactorBandSmr {
-    /// SMR per scalefactor band, in energy ratio (not dB).
-    /// Sized for the maximum long-block band count (22 bands).
-    /// Bands beyond the sample rate's actual count are set to 1.0.
+    /// SMR per *long*-block scalefactor band, in energy ratio (not dB).
+    /// Sized for the maximum long-block band count (22 bands). Bands
+    /// beyond the sample rate's actual count are set to 1.0. Applies to
+    /// `BlockType::Long`/`Start`/`Stop` granules -- all three are
+    /// long-block-shaped (576 lines, no window subdivision), so they
+    /// share this grid.
     pub bands: [f32; 22],
+
+    /// SMR per *short*-block scalefactor band, for `BlockType::Short`
+    /// granules. Sized for the short-block band count, which is a fixed
+    /// 13 across every supported sample rate (see `SFB_SHORT_COUNTS`).
+    /// One value per band, shared across all 3 windows within the
+    /// granule -- matches `quantize::loop_control::build_band_map`'s
+    /// current per-flat-band granularity for short blocks (all 3
+    /// windows of a given band already collapse onto one scalefactor
+    /// and one distortion check there), not a per-window-of-3
+    /// refinement; that would need `build_band_map` and the scalefactor
+    /// storage to become window-aware too; out of scope here.
+    ///
+    /// This field exists because reusing `bands` (the long-block grid)
+    /// for short-block distortion checks compares each short scalefactor
+    /// band against a masking threshold computed for a *different*
+    /// frequency range -- `SFB_LONG_BOUNDARIES` and `SFB_SHORT_BOUNDARIES`
+    /// don't line up index-for-index. See `docs/investigation-log.md` §11's
+    /// "still open" note and `build_band_map`'s own doc comment for the
+    /// bug this fixes: the outer loop's per-band distortion ceiling was
+    /// silently keyed to the wrong band grid for every transient
+    /// (short-block) granule, which is exactly when the psychoacoustic
+    /// model's per-band precision matters most (limiting how far
+    /// quantization noise spreads in time -- pre-echo).
+    pub short_bands: [f32; 13],
 }
 
 // ---------------------------------------------------------------------------
@@ -364,6 +391,39 @@ impl PsychoacousticModel {
             }
         }
 
+        // Step 7b: Map the *same* per-partition SMR to short-block
+        // scalefactor bands too (see `ScalefactorBandSmr::short_bands`'s
+        // doc comment for why this parallel mapping exists). One short
+        // window is 192 lines (32 subbands × 6 lines each -- see
+        // `Encoder::mdct_stage`'s `BlockType::Short` branch), a third of
+        // the long-block granule's 576, so the line→Hz scale is `192`
+        // here, not `576`.
+        let sfb_s_count = SFB_SHORT_COUNTS[sfb_idx];
+        let sfb_s_bounds = &SFB_SHORT_BOUNDARIES[sfb_idx];
+        let mut sfb_smr_short = [1.0f32; 13];
+        for sfb in 0..sfb_s_count {
+            let start_line = sfb_s_bounds[sfb];
+            let end_line = sfb_s_bounds[sfb + 1];
+
+            let start_freq = start_line as f32 * sample_rate_hz as f32 / (2.0 * 192.0);
+            let end_freq = end_line as f32 * sample_rate_hz as f32 / (2.0 * 192.0);
+            let start_bin = floor(start_freq / freq_per_bin) as usize;
+            let end_bin = (ceil(end_freq / freq_per_bin) as usize).min(FFT_BINS_LONG - 1);
+
+            if end_bin > start_bin {
+                let mut visited = [false; MAX_PARTITIONS];
+                for &p in &partitions.partition_of_bin[start_bin..end_bin] {
+                    let p = p as usize;
+                    if p < visited.len() && !visited[p] {
+                        visited[p] = true;
+                        if part_smr[p] > sfb_smr_short[sfb] {
+                            sfb_smr_short[sfb] = part_smr[p];
+                        }
+                    }
+                }
+            }
+        }
+
         // Step 8: Perceptual entropy + block-type decision
         let pe = self.compute_perceptual_entropy(
             &part_energy,
@@ -382,7 +442,13 @@ impl PsychoacousticModel {
             };
         }
 
-        (ScalefactorBandSmr { bands: sfb_smr }, self.block_type)
+        (
+            ScalefactorBandSmr {
+                bands: sfb_smr,
+                short_bands: sfb_smr_short,
+            },
+            self.block_type,
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -465,7 +531,7 @@ impl PsychoacousticModel {
     /// was -- so `decide_block_type`'s `pe_ratio` never moved enough to
     /// cross `PE_ATTACK_THRESHOLD_DB`, and short blocks could never
     /// trigger on real audio (confirmed empirically: 0 of 3360 granules
-    /// on a real, percussive recording). See `docs/mejoras.md`'s
+    /// on a real, percussive recording). See `docs/investigation-log.md`'s
     /// gain-bug investigation notes.
     fn compute_perceptual_entropy(
         &self,
@@ -553,7 +619,7 @@ fn ath_from_db(db: f32) -> f32 {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)] // f32::abs() in test assertions -- see docs/mejoras.md §7 item 6
+#[allow(clippy::disallowed_methods)] // f32::abs() in test assertions -- see docs/investigation-log.md §7 item 6
 mod tests {
     use super::*;
     use alloc::vec;
@@ -644,6 +710,68 @@ mod tests {
         for (i, &s) in smr.bands.iter().enumerate().take(22) {
             assert!(s >= 1.0, "SMR band {i} is {s}, should be >= 1.0");
         }
+    }
+
+    #[test]
+    fn smr_short_bands_tone_produces_high_smr_near_own_frequency() {
+        // Mirrors `smr_tone_produces_high_smr_at_own_frequency`, but for
+        // the short-block grid this fix adds (`short_bands`) -- guards
+        // against the bug docs/investigation-log.md §11 describes: `short_bands`
+        // used to not exist at all, so `quantize_granule` compared
+        // short-block distortion against `bands` (a masking profile
+        // keyed to the *long*-block frequency-to-band mapping).
+        let mut model = make_model(44100);
+        let tone = make_tone(1000.0, 44100, 1024);
+        let (smr, _bt) = model.analyze_granule(&tone, 44100);
+
+        let has_high_smr = smr.short_bands.iter().any(|&s| s > 2.0);
+        assert!(
+            has_high_smr,
+            "tone should produce short-block SMR > 1.0 in some bands, got {:?}",
+            smr.short_bands
+        );
+
+        for (i, &s) in smr.short_bands.iter().enumerate() {
+            assert!(s >= 1.0, "short SMR band {i} is {s}, should be >= 1.0");
+        }
+    }
+
+    #[test]
+    fn smr_short_bands_peak_falls_in_the_tones_own_frequency_range() {
+        // Correctness check for Step 7b's line->Hz conversion (`* 192`
+        // scale, not `* 576`): the short-block band with the highest SMR
+        // for a pure tone should be the one whose own
+        // `SFB_SHORT_BOUNDARIES` range, converted to Hz with the *same*
+        // formula `analyze_granule` uses, actually contains the tone's
+        // frequency. A wrong scale (e.g. accidentally reusing the
+        // long-block `/576` divisor) would shift every band's Hz range
+        // and make this fail even though `short_bands` itself would
+        // still look superficially plausible (finite, some band > 1.0).
+        const SAMPLE_RATE: u32 = 44100;
+        const TONE_HZ: f32 = 6000.0;
+
+        let mut model = make_model(SAMPLE_RATE);
+        let tone = make_tone(TONE_HZ, SAMPLE_RATE, 1024);
+        let (smr, _bt) = model.analyze_granule(&tone, SAMPLE_RATE);
+
+        let sfb_idx = scalefactor_sample_rate_index(SAMPLE_RATE);
+        let bounds = &SFB_SHORT_BOUNDARIES[sfb_idx];
+        let count = SFB_SHORT_COUNTS[sfb_idx];
+
+        let (peak_band, _) = smr.short_bands[..count]
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap();
+
+        let start_hz = bounds[peak_band] as f32 * SAMPLE_RATE as f32 / (2.0 * 192.0);
+        let end_hz = bounds[peak_band + 1] as f32 * SAMPLE_RATE as f32 / (2.0 * 192.0);
+        assert!(
+            (start_hz..end_hz).contains(&TONE_HZ),
+            "peak short band {peak_band} spans {start_hz}-{end_hz} Hz, \
+             doesn't contain the {TONE_HZ} Hz tone -- short-block Hz \
+             conversion scale looks wrong"
+        );
     }
 
     #[test]
