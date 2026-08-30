@@ -123,18 +123,39 @@ cargo build --release -p mp3-cli   # binary lands at target/release/encorust
 ./target/release/encorust -o output.mp3 -b 192 input.wav
 ```
 
-To sanity-check the result (waveform, spectrogram, peak/RMS levels)
-against the original, use `ffmpeg`:
+### Checking encode quality: `compare_audio.sh`
+
+`./compare_audio.sh input.wav output.mp3` is this project's actual
+audio-quality review tool — use it any time you change something in the
+quantizer, psychoacoustic model, or bitstream layer and want to know
+whether it made real output better or worse, not just whether it still
+compiles.
 
 ```bash
-ffmpeg -i input.wav -af "astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.Peak_level" -f null -
-ffmpeg -i output.mp3 -af "astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.Peak_level" -f null -
+./compare_audio.sh input.wav output.mp3
+SKIP_IMAGES=1 ./compare_audio.sh input.wav output.mp3   # faster reruns, skip the PNGs
 ```
 
-Decoding with `ffmpeg` (or any standards-compliant decoder, not this
-project's own encoder logic) is important when debugging encoder bugs —
-it's the only way to tell whether output that sounds wrong is a real
-bitstream problem versus something specific to one decoder.
+It decodes the MP3 back to PCM with `ffmpeg` (a standards-compliant,
+external decoder — never this project's own encoder logic, which is the
+only way to tell a real bitstream bug from something specific to one
+decoder) and reports:
+
+- **Waveform and spectrogram PNGs** — a quick visual sanity check only.
+  They can look nearly identical to the original even when the encode is
+  badly wrong at the sample level, so don't stop here.
+- **Level/loudness stats** (peak, RMS, integrated loudness) via `ffmpeg`'s
+  own filters.
+- **The number that actually matters**: a lag-aligned time-domain
+  correlation scan (`scripts/audio_fidelity.py`) plus a per-frequency-band
+  breakdown, so you can tell not just *that* something got worse but
+  *where* in the spectrum. Rough reading: correlation `> 0.8` at a sharp,
+  symmetric lag is solid; `0.5–0.8` is audible-but-ordinary lossy loss;
+  below `0.5`, or no single dominant lag, means severe/structural
+  distortion.
+
+Needs `ffmpeg` and `python3` + `numpy` on `PATH`; the script degrades
+gracefully (skips that section) if either is missing.
 
 ## Status
 
