@@ -15,7 +15,7 @@ disallowed-methods = [
     { path = "f32::sqrt", reason = "std-only; use `libm::sqrtf` instead" },
     { path = "f32::round", reason = "std-only; use `libm::roundf` instead" },
     # Found live in production code (quantize/loop_control.rs) during the
-    # docs/mejoras.md review — this crate's MSRV (1.82) predates `abs()`
+    # docs/investigation-log.md review — this crate's MSRV (1.82) predates `abs()`
     # moving into `core::f32`, so it's std-only here same as the above,
     # despite not needing libm's actual math (it's a bitmask op) — the
     # fix is still `libm::fabsf`, which provides it under `no_std` too.

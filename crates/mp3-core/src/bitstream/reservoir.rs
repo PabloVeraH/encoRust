@@ -253,7 +253,7 @@ pub fn split_bits_for_granules(total_bits: u32, pe_granule0: f32, pe_granule1: f
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)] // f32::abs() in test assertions -- see docs/mejoras.md §7 item 6
+#[allow(clippy::disallowed_methods)] // f32::abs() in test assertions -- see docs/investigation-log.md §7 item 6
 mod tests {
     use super::*;
 

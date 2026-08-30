@@ -28,12 +28,12 @@ struct Args {
     bitrate: Option<u32>,
 
     /// Average bitrate in kbps (not yet implemented — use `--bitrate`).
-    /// See docs/mejoras.md §2.2 and docs/plus.md M13.
+    /// See docs/investigation-log.md §2.2 and docs/plus.md M13.
     #[arg(long, conflicts_with_all = ["bitrate", "vbr_quality"])]
     abr: Option<u32>,
 
     /// VBR quality target, 0 (highest) - 9 (smallest) — not yet implemented.
-    /// See docs/mejoras.md §2.2 and docs/plus.md M13.
+    /// See docs/investigation-log.md §2.2 and docs/plus.md M13.
     #[arg(long, conflicts_with_all = ["bitrate", "abr"])]
     vbr_quality: Option<u8>,
 
@@ -100,12 +100,12 @@ fn run() -> anyhow::Result<()> {
     } else if args.abr.is_some() {
         bail!(
             "ABR rate control is not yet implemented. Use --bitrate for CBR \
-             encoding instead. See docs/mejoras.md §2.2 and docs/plus.md M13."
+             encoding instead. See docs/investigation-log.md §2.2 and docs/plus.md M13."
         );
     } else if args.vbr_quality.is_some() {
         bail!(
             "VBR rate control is not yet implemented. Use --bitrate for CBR \
-             encoding instead. See docs/mejoras.md §2.2 and docs/plus.md M13."
+             encoding instead. See docs/investigation-log.md §2.2 and docs/plus.md M13."
         );
     } else {
         bail!("specify --bitrate (--abr and --vbr-quality are not yet implemented)");
