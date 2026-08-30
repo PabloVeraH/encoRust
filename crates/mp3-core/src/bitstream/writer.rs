@@ -109,7 +109,7 @@ impl<'a> BitWriter<'a> {
     /// byte-readable) gets appended to a shared, continuously-packed
     /// bitstream without introducing that gap. See
     /// `docs/mp3-encoder/11-phase8-bitstream-multiplexing.md` §1 and the
-    /// gain/corruption bug this fixes in `docs/mejoras.md`'s
+    /// gain/corruption bug this fixes in `docs/investigation-log.md`'s
     /// investigation notes.
     ///
     /// # Panics

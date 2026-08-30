@@ -1,6 +1,6 @@
 //! M-6: regression test confirming `Encoder::encode_frame` performs zero
 //! heap allocations on the steady-state path after the first warm-up
-//! call.  This locks in M-1 through M-4 from `docs/mejoras.md` against
+//! call.  This locks in M-1 through M-4 from `docs/investigation-log.md` against
 //! future regression.
 //!
 //! Uses a counting wrapper around the system allocator. The test is

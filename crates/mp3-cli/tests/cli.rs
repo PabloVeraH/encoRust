@@ -83,7 +83,7 @@ fn encodes_cbr_stereo_wav_end_to_end() {
 fn abr_vbr_rejected_with_clear_message() {
     // ABR and VBR are not yet implemented — verifying the CLI surfaces
     // this clearly rather than silently producing fixed-bitrate CBR
-    // output (see docs/mejoras.md §2.2). An intermediate version of this
+    // output (see docs/investigation-log.md §2.2). An intermediate version of this
     // branch accepted `--abr` while it behaved identically to CBR under
     // the hood — reintroducing exactly the silent-no-op anti-pattern
     // this test exists to catch; see docs/plus.md's review notes.

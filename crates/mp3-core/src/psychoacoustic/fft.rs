@@ -139,7 +139,7 @@ fn fft_radix2(n: usize, re: &mut [f32], im: &mut [f32]) {
 }
 
 #[cfg(test)]
-// Scoped to `tests` only — see docs/mejoras.md §7 item 6.
+// Scoped to `tests` only — see docs/investigation-log.md §7 item 6.
 #[allow(clippy::needless_range_loop, clippy::disallowed_methods)]
 mod tests {
     use super::*;

@@ -338,7 +338,7 @@ impl RegionSplit {
             // `region0_end = band_index[region0_count + 1]` and
             // `region1_end = band_index[region0_count + 1 + region1_count + 1]`
             // (verified against an external reference during the M11
-            // gain/corruption investigation -- see docs/mejoras.md).
+            // gain/corruption investigation -- see docs/investigation-log.md).
             //
             // An earlier version computed `region0_count`/`region1_count`
             // this way but then wrote the *actual* big_values bytes using
@@ -399,7 +399,7 @@ impl RegionSplit {
             // implementation (FlorisCreyf/mp3-decoder: `if
             // (window_switching && block_type == 2) { region0 = 36;
             // region1 = 576; }`) during the M11 gain/corruption
-            // investigation -- see docs/mejoras.md. An earlier version
+            // investigation -- see docs/investigation-log.md. An earlier version
             // computed a content-dependent, scalefactor-band-aligned
             // split here instead (self-consistent internally, since this
             // encoder never decodes its own output the way a real
