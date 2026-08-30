@@ -3,6 +3,16 @@
 A pure-Rust MPEG-1/2 Layer III (MP3) encoder — no C dependencies, no FFI —
 designed for real-time use and WebAssembly targets.
 
+**What this project actually is**: an experimental, from-scratch lab
+effort to reimplement LAME's approach — the psychoacoustic model, the
+quantization loop, the bitstream format — natively in Rust, to explore
+how far a memory-safe, dependency-free encoder can get against a
+decades-old, heavily tuned C reference. It's a research project, not
+(yet) a polished, production-ready alternative to LAME. See
+[Status](#status) below for what's actually implemented versus still in
+progress, and `docs/investigation-log.md` for the ongoing investigation into known
+audio-quality gaps.
+
 ## Why
 
 The Rust ecosystem has several pure-Rust MP3 *decoders* (Symphonia,
@@ -10,11 +20,15 @@ puremp3, nanomp3), but every MP3 *encoder* available today is an FFI
 binding to a C library (LAME, Shine). encoRust fills that gap with a
 codec written natively in Rust:
 
-- **Real-time friendly**: the encode path is allocation-free after
-  construction (enforced by a counting-allocator regression test — see
-  `crates/mp3-core/tests/m10_zero_alloc.rs`), with predictable
-  worst-case latency — suitable for live audio (e.g. encoding a
-  microphone feed).
+- **Real-time friendly — a design goal, partially verified**: the encode
+  path targets zero heap allocations after construction, for predictable
+  worst-case latency in live audio (e.g. encoding a microphone feed). A
+  counting-allocator regression test
+  (`crates/mp3-core/tests/m10_zero_alloc.rs`) confirms this holds for the
+  narrowest configuration it exercises — mono, CBR, long-block-only
+  content — but does **not** yet cover stereo/joint-stereo, ABR/VBR, or
+  transient (short-block) encoding. Read "zero allocations" as verified
+  for that one path today, not as a blanket guarantee across every mode.
 - **WASM as a first-class target**: the core crate is `no_std`-friendly
   and compiles to `wasm32-unknown-unknown`, so the same encoder runs on a
   server or inside a browser `AudioWorklet`.
@@ -56,10 +70,13 @@ CBR-only encoder:
 
 - **No build-time C dependencies**: a single `cargo build` produces the
   binary. No libmp3lame-dev, no cmake, no system library hunt.
-- **Predictable latency**: the encode hot path is verified allocation-free
-  (regression test: `m10_zero_alloc.rs`). FFI boundaries and C allocators
-  don't offer that guarantee — critical in an `AudioWorklet` callback
-  where a GC pause or `malloc` stall drops audio.
+- **Predictable latency — for the one path this is actually verified
+  on today**: the encode hot path is allocation-free in the mono/CBR/
+  long-block configuration `m10_zero_alloc.rs` exercises. FFI boundaries
+  and C allocators don't offer even that much of a guarantee — critical
+  in an `AudioWorklet` callback where a GC pause or `malloc` stall drops
+  audio — but encoRust hasn't yet proven the same holds for stereo,
+  ABR/VBR, or short-block paths.
 
 MP3 is patent-free worldwide since 2017. This project is written from the
 ISO/IEC 11172-3 / 13818-3 specifications and independent research.
