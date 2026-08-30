@@ -3,8 +3,14 @@
 **/*.rs.bk
 *.pdb
 
+# --- Local tooling ---
+/WebEncoder/
+
 # --- Development plan (kept local, not published) ---
-/docs/
+# Exception: investigation-log.md is tracked and published (referenced
+# from README.md) -- everything else under docs/ stays local.
+/docs/*
+!/docs/investigation-log.md
 
 # --- AI agent/tool local config/state (not project code) ---
 .claude/
@@ -16,6 +22,13 @@
 *.wav.local
 *.wav
 *.mp3
+
+# --- compare_audio.sh diagnostic outputs (local only) ---
+.compare_audio_tmp.*/
+comparison_original.png
+comparison_encoded.png
+spectrogram_original.png
+spectrogram_encoded.png
 
 # --- Editor / OS cruft ---
 .DS_Store
