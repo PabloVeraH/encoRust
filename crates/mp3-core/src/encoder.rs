@@ -38,7 +38,7 @@ const MAX_SCALEFACTOR_BITS_PER_GRANULE: u32 = 39 * 4;
 /// Maximum frame size in bytes for any legal MPEG-1 CBR configuration:
 /// `144 × 320000 / 32000 + 1` = 1441. Used to size pre-allocated buffers
 /// so `encode_frame` never allocates after construction.
-/// See `docs/mejoras.md` §3.2, M-3.
+/// See `docs/investigation-log.md` §3.2, M-3.
 const MAX_FRAME_BYTES: usize = 1441;
 
 /// Maximum per-granule-channel main_data in bytes: `MAX_FRAME_BYTES / 2`
@@ -225,7 +225,7 @@ impl Encoder {
         // — accepting `Abr` here would silently produce byte-identical
         // CBR output while claiming to honor an average-bitrate target,
         // exactly the "feature that appears to work while silently
-        // ignoring the user's request" anti-pattern `docs/mejoras.md`
+        // ignoring the user's request" anti-pattern `docs/investigation-log.md`
         // §2.2 already fixed once for both variants. Re-enabling `Abr`
         // needs the real averaging controller from `docs/plus.md` M13.4
         // first, not just removing this check.
@@ -639,6 +639,34 @@ impl Encoder {
             }
         }
 
+        // Compensate for the frequency inversion inherent to the
+        // polyphase analysis filterbank's cosine-modulation matrix
+        // (`PolyphaseFilterbank::analyze`'s `M[k][i] = cos((2k+1)(i-16)π/64)`):
+        // for every ODD-numbered subband, every OTHER time sample within
+        // the granule comes out of the filterbank with its sign flipped
+        // relative to the subband's true baseband signal -- a property
+        // of this cosine-modulated filterbank family, not a filterbank
+        // bug (the per-subband *energy* is unaffected, which is why the
+        // filterbank's own unit tests and a spectrogram both look
+        // correct despite this). Left uncorrected, the MDCT that follows
+        // transforms an effectively frequency-mirrored signal for every
+        // odd subband, corrupting fine spectral structure while leaving
+        // gross energy/subband allocation intact -- exactly the
+        // "spectrogram looks right, ~0 sample correlation" signature
+        // documented in docs/investigation-log.md §11. Verified against two
+        // independent, mutually-agreeing open-source encoders: Shine
+        // (`shine_mdct_sub`, `l3mdct.c`: "Compensate for inversion in the
+        // analysis filter (every odd index of band AND k)") and LAME
+        // (`mdct_sub48`, `newmdct.c`: "Compensate for inversion in the
+        // analysis filter") -- both apply this same negation, at the
+        // same (odd subband, odd time-sample) positions, immediately
+        // after the analysis filterbank and before MDCT.
+        for sb in (1..SUBBANDS).step_by(2) {
+            for fbc in (1..18).step_by(2) {
+                subband_samples[sb][fbc] = -subband_samples[sb][fbc];
+            }
+        }
+
         PreMdctAnalysis {
             ch,
             subband_samples,
@@ -769,7 +797,10 @@ impl Encoder {
         );
 
         if !quant_result.converged && scalefac_bits + huffman_bits > per_channel_bits {
-            let flat_smr = ScalefactorBandSmr { bands: [1.0; 22] };
+            let flat_smr = ScalefactorBandSmr {
+                bands: [1.0; 22],
+                short_bands: [1.0; 13],
+            };
             (
                 quant_result,
                 scalefac_compress,
@@ -935,4 +966,161 @@ fn default_granule_side_info() -> crate::bitstream::side_info::GranuleSideInfo {
 mod tests {
     // See crates/mp3-core/tests/m8_bitstream.rs for `Encoder`'s
     // integration tests.
+
+    use super::*;
+    use crate::bitstream::reservoir::RateControl;
+    use crate::types::{ChannelMode, MpegVersion, SampleRate};
+    use crate::Bitrate;
+
+    /// Diagnostic-only, not a regression test: docs/investigation-log.md §11,
+    /// "Where the next session should start", step 1. Runs a pure 1kHz
+    /// tone through the *real* filterbank + MDCT + psychoacoustic model
+    /// (via the real `encode_frame` pipeline) but bypasses
+    /// `quantize_granule`'s own search entirely -- scalefac forced to
+    /// all-zero, `step` a hand-picked fixed value (not searched), via
+    /// `quantize::loop_control::set_debug_fixed_step`. Writes the
+    /// original tone and the encoded MP3 to `$DIAG_OUT_DIR` (default
+    /// `/tmp`) for external correlation analysis (ffmpeg decode +
+    /// cross-correlation) -- this isolates whether the ~0-correlation
+    /// fidelity bug lives upstream (filterbank/MDCT/mdct_prev_tail) or
+    /// downstream (quantizer/rate-loop interaction) of quantization.
+    ///
+    /// `#[ignore]`d: writes files to disk as a side effect, which is
+    /// fine for an ad-hoc investigation run but not for the default
+    /// `cargo test` suite. Run explicitly with
+    /// `cargo test -p mp3-core --lib diag_bypass_quantizer_pure_tone -- --ignored --nocapture`
+    /// (optionally with `DIAG_OUT_DIR=<dir>` to control where
+    /// `diag_tone.mp3` / `diag_tone_original.wav` land -- default `/tmp`,
+    /// which may be unreachable to a sandboxed `ffmpeg` such as a snap
+    /// package; use a directory under `$HOME` in that case).
+    #[test]
+    #[ignore]
+    fn diag_bypass_quantizer_pure_tone() {
+        const SR_HZ: u32 = 44100;
+        const FREQ: f32 = 1000.0;
+        const AMP: f32 = 0.3;
+        const N_FRAMES: usize = 80; // ~2.1s at 1152 samples/frame
+
+        let samples_per_frame = MpegVersion::Mpeg1.samples_per_frame(); // 1152
+        let total_samples = N_FRAMES * samples_per_frame;
+
+        // Generate the tone once, as i16, so the encoder's input and the
+        // reference WAV written below are bit-identical.
+        let tone_i16: Vec<i16> = (0..total_samples)
+            .map(|n| {
+                let t = n as f32 / SR_HZ as f32;
+                (AMP * libm::sinf(2.0 * core::f32::consts::PI * FREQ * t) * 32767.0) as i16
+            })
+            .collect();
+
+        // --- Probe pass: run the real analysis stages on a throwaway
+        // encoder for a few granules to find a representative peak
+        // |spectrum| line, so the fixed step below can be chosen to keep
+        // `ix` comfortably unsaturated (target ~1000, vs the
+        // MAX_REPRESENTABLE_IX=8206 ceiling) instead of guessed blind.
+        // This encoder instance is discarded -- never mixed with the
+        // real diagnostic encode below, so filterbank/psychoacoustic
+        // state can't leak between them.
+        let mut probe = Encoder::new(EncoderConfig::new(
+            SampleRate::Hz44100,
+            ChannelMode::Mono,
+            RateControl::Cbr(Bitrate::Kbps320),
+        ))
+        .expect("probe encoder");
+        let mut max_abs = 0.0f32;
+        for frame in tone_i16.chunks(samples_per_frame).take(4) {
+            let pcm = PcmBuffer::from_i16_interleaved(frame, ChannelMode::Mono, MpegVersion::Mpeg1)
+                .expect("pcm");
+            let pcm_ch = pcm.channel(0);
+            for gr in 0..2 {
+                let gr_offset = gr * crate::types::SAMPLES_PER_GRANULE;
+                let mut pcm_window = [0.0f32; 1024];
+                let copy_len = crate::types::SAMPLES_PER_GRANULE.min(pcm_ch.len() - gr_offset);
+                pcm_window[PCM_HISTORY_SAMPLES..PCM_HISTORY_SAMPLES + copy_len]
+                    .copy_from_slice(&pcm_ch[gr_offset..gr_offset + copy_len]);
+                let pre = probe.analyze_pre_mdct(
+                    0,
+                    gr,
+                    pcm_ch,
+                    crate::types::SAMPLES_PER_GRANULE,
+                    &pcm_window,
+                );
+                let spectrum = probe.mdct_stage(0, &pre.subband_samples, pre.block_type);
+                for &v in &spectrum {
+                    if v.abs() > max_abs {
+                        max_abs = v.abs();
+                    }
+                }
+            }
+        }
+        assert!(max_abs > 0.0, "probe found no signal -- test setup bug");
+
+        // Solve for `step` so the peak line's `ix` lands near
+        // `target_ix`: ix = (max_abs * 2^(-step/4))^0.75 (QUANT_OFFSET
+        // omitted -- negligible next to target_ix).
+        let target_ix = 1000.0f32;
+        let target_scaled = libm::powf(target_ix, 4.0 / 3.0);
+        let step = -4.0 * libm::log2f(target_scaled / max_abs);
+
+        // --- Real diagnostic encode: fresh encoder, quantizer bypassed
+        // to the fixed step + scalefac=0 chosen above.
+        crate::quantize::loop_control::set_debug_fixed_step(Some(step));
+        let mut encoder = Encoder::new(EncoderConfig::new(
+            SampleRate::Hz44100,
+            ChannelMode::Mono,
+            RateControl::Cbr(Bitrate::Kbps320),
+        ))
+        .expect("encoder creation");
+
+        let mut mp3_bytes = Vec::new();
+        for frame in tone_i16.chunks(samples_per_frame) {
+            if frame.len() < samples_per_frame {
+                break;
+            }
+            let pcm = PcmBuffer::from_i16_interleaved(frame, ChannelMode::Mono, MpegVersion::Mpeg1)
+                .expect("pcm");
+            encoder
+                .encode_frame(&pcm, &mut mp3_bytes)
+                .expect("encode_frame");
+        }
+        crate::quantize::loop_control::set_debug_fixed_step(None);
+
+        // --- Write outputs for external correlation analysis.
+        let scratch = std::env::var("DIAG_OUT_DIR").unwrap_or_else(|_| "/tmp".to_string());
+        std::fs::write(format!("{scratch}/diag_tone.mp3"), &mp3_bytes).expect("write mp3");
+        let wav = write_wav_mono_i16(SR_HZ, &tone_i16);
+        std::fs::write(format!("{scratch}/diag_tone_original.wav"), &wav).expect("write wav");
+
+        eprintln!(
+            "diag_bypass_quantizer_pure_tone: step={step:.2} max_abs_spectrum={max_abs:.4} \
+             wrote {} bytes mp3 / {} samples wav to {scratch}",
+            mp3_bytes.len(),
+            tone_i16.len()
+        );
+    }
+
+    /// Minimal canonical-PCM WAV writer -- no external crate needed for
+    /// this diagnostic-only test.
+    fn write_wav_mono_i16(sample_rate: u32, samples: &[i16]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let data_len = (samples.len() * 2) as u32;
+        let byte_rate = sample_rate * 2;
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(36 + data_len).to_le_bytes());
+        out.extend_from_slice(b"WAVE");
+        out.extend_from_slice(b"fmt ");
+        out.extend_from_slice(&16u32.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        out.extend_from_slice(&1u16.to_le_bytes()); // mono
+        out.extend_from_slice(&sample_rate.to_le_bytes());
+        out.extend_from_slice(&byte_rate.to_le_bytes());
+        out.extend_from_slice(&2u16.to_le_bytes()); // block align
+        out.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&data_len.to_le_bytes());
+        for &s in samples {
+            out.extend_from_slice(&s.to_le_bytes());
+        }
+        out
+    }
 }
