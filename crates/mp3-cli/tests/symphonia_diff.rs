@@ -4,7 +4,7 @@
 //! signal against the original.  This is the test that would have caught
 //! the §2.1 block_type discrepancy on day one.
 //!
-//! See `docs/mejoras.md` §6.
+//! See `docs/investigation-log.md` §6.
 
 use std::io::Cursor;
 
@@ -228,5 +228,152 @@ fn symphonia_parses_encoded_mp3() {
     assert!(
         reader.is_ok(),
         "symphonia must recognize our output as valid MP3"
+    );
+}
+
+/// Diagnostic-only, not a regression test: docs/investigation-log.md §11's Session
+/// 5, "where the next session should start", item 2 -- cross-checks
+/// Symphonia's own decode of a genuinely broadband, dense-spectrum
+/// signal (the kind of content that reproduces the ~+12 dBFS decode-peak
+/// clipping documented there) against what `ffmpeg` independently
+/// decodes from the *exact same bytes*. If both agree there's an
+/// anomalous peak at the same position, the fault is in what this
+/// encoder's bitstream values reconstruct to (a real DSP issue,
+/// independent of which decoder reads them) -- if only ffmpeg shows it,
+/// the fault is decoder-side/ffmpeg-specific.
+///
+/// `#[ignore]`d: shells out to `ffmpeg`, writes a scratch file. Run
+/// explicitly:
+/// `cargo test -p mp3-cli --test symphonia_diff diag_noise_peak_cross_check -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn diag_noise_peak_cross_check() {
+    use std::io::Write;
+    use std::process::Command;
+
+    // Same shape of signal that reproduced the clipping in
+    // docs/investigation-log.md §11 Session 4/5: dense broadband noise at ~60% of
+    // full scale, several seconds long (long enough to cover many
+    // granules, unlike `make_mono_samples`' short/quiet default use in
+    // the round-trip test above).
+    const SR: u32 = 44100;
+    const SECONDS: usize = 6;
+    let n = SR as usize * SECONDS;
+    let mut state: u32 = 0x2A2A_2A2A;
+    let pcm: Vec<i16> = (0..n)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let unit = (state as f32 / u32::MAX as f32) * 2.0 - 1.0; // [-1,1]
+            (unit * 0.6 * 32767.0) as i16
+        })
+        .collect();
+
+    let config = EncoderConfig::new(
+        SampleRate::Hz44100,
+        ChannelMode::Mono,
+        mp3_core::bitstream::reservoir::RateControl::Cbr(Bitrate::Kbps192),
+    );
+    let mut encoder = mp3_core::Encoder::new(config).expect("encoder creation");
+    let mut mp3_bytes = Vec::new();
+    for chunk in pcm.chunks(1152) {
+        if chunk.len() < 1152 {
+            break;
+        }
+        let buf = PcmBuffer::from_i16_interleaved(chunk, ChannelMode::Mono, MpegVersion::Mpeg1)
+            .expect("pcm buffer");
+        encoder
+            .encode_frame(&buf, &mut mp3_bytes)
+            .expect("encode_frame");
+    }
+
+    // --- Decode with Symphonia (in-process, no shell-out) ---
+    let sym_decoded = decode_with_symphonia(&mp3_bytes);
+    let sym_peak_idx = sym_decoded
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.abs().partial_cmp(&b.abs()).unwrap())
+        .map(|(i, _)| i)
+        .unwrap();
+    let sym_peak_val = sym_decoded[sym_peak_idx];
+    eprintln!(
+        "Symphonia: {} samples decoded, peak |{:.8}| at index {sym_peak_idx} ({:.2}s)",
+        sym_decoded.len(),
+        sym_peak_val,
+        sym_peak_idx as f64 / SR as f64
+    );
+    for thresh in [1.0, 0.9, 0.7, 0.65] {
+        let n = sym_decoded.iter().filter(|&&s| s.abs() > thresh).count();
+        eprintln!(
+            "Symphonia: {n} of {} samples exceed |{thresh}|",
+            sym_decoded.len()
+        );
+    }
+    // Source PCM was generated at 60% of full scale ([-0.6, 0.6]) -- any
+    // *correct* reconstruction should stay close to that range, not
+    // merely under 1.0. Report how far over the *source* amplitude
+    // Symphonia's reconstruction goes, not just whether it clips.
+    let sym_over_source_amp = sym_decoded.iter().filter(|&&s| s.abs() > 0.6).count();
+    eprintln!(
+        "Symphonia: {sym_over_source_amp} of {} samples exceed the source's own 0.6 amplitude",
+        sym_decoded.len()
+    );
+
+    // --- Decode the *exact same bytes* with ffmpeg, out-of-process ---
+    let scratch = std::env::var("DIAG_OUT_DIR").unwrap_or_else(|_| ".".to_string());
+    let mp3_path = format!("{scratch}/diag_noise_cross_check.mp3");
+    let wav_path = format!("{scratch}/diag_noise_cross_check_ffmpeg.wav");
+    std::fs::File::create(&mp3_path)
+        .and_then(|mut f| f.write_all(&mp3_bytes))
+        .expect("write mp3 scratch file");
+
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y", "-hide_banner", "-loglevel", "error", "-i", &mp3_path, "-ac", "1", "-ar",
+            "44100", "-c:a", "pcm_s16le", &wav_path,
+        ])
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            let wav_bytes = std::fs::read(&wav_path).expect("read ffmpeg wav output");
+            // Minimal canonical-WAV PCM parse: 44-byte header, then raw
+            // little-endian i16 samples.
+            let pcm_bytes = &wav_bytes[44..];
+            let ffmpeg_decoded: Vec<f32> = pcm_bytes
+                .chunks_exact(2)
+                .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+                .collect();
+            let ff_peak_idx = ffmpeg_decoded
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.abs().partial_cmp(&b.abs()).unwrap())
+                .map(|(i, _)| i)
+                .unwrap();
+            eprintln!(
+                "ffmpeg:    {} samples decoded, peak |{:.8}| at index {ff_peak_idx} ({:.2}s)",
+                ffmpeg_decoded.len(),
+                ffmpeg_decoded[ff_peak_idx],
+                ff_peak_idx as f64 / SR as f64
+            );
+            let ff_clipped = ffmpeg_decoded.iter().filter(|&&s| s.abs() >= 0.999).count();
+            eprintln!(
+                "ffmpeg:    {ff_clipped} of {} samples hit/exceed the int16 clip boundary",
+                ffmpeg_decoded.len()
+            );
+            let ff_over_source_amp = ffmpeg_decoded.iter().filter(|&&s| s.abs() > 0.6).count();
+            eprintln!(
+                "ffmpeg:    {ff_over_source_amp} of {} samples exceed the source's own 0.6 amplitude",
+                ffmpeg_decoded.len()
+            );
+        }
+        Ok(s) => eprintln!("ffmpeg exited with status {s} -- skipping ffmpeg-side comparison"),
+        Err(e) => eprintln!("failed to run ffmpeg ({e}) -- skipping ffmpeg-side comparison"),
+    }
+
+    eprintln!(
+        "\nIf Symphonia's peak is also >> 1.0 (or its own clip-equivalent) at a matching \
+         time, both independent decoders agree the encoded values themselves are the \
+         problem. If Symphonia's peak stays near/under 1.0, the issue is decoder-specific."
     );
 }
