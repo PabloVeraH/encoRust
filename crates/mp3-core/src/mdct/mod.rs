@@ -251,7 +251,7 @@ pub fn window_for_type(bt: BlockType) -> [f32; 36] {
 /// decoding against real recordings (this crate's own quantize/
 /// dequantize round-trip is self-consistent regardless of this factor,
 /// which is exactly why testing only against this encoder's own logic
-/// hid it) — see `docs/mejoras.md`'s gain-bug investigation notes.
+/// hid it) — see `docs/investigation-log.md`'s gain-bug investigation notes.
 pub fn mdct_36(z: &[f32; 36]) -> [f32; 18] {
     const SCALE: f32 = 2.0 / 18.0;
     let mut out = [0.0f32; 18];
@@ -290,7 +290,7 @@ pub fn mdct_12(z: &[f32; 12]) -> [f32; 6] {
 /// `prev_tail` (old) + `input` (new) → window → forward MDCT.
 ///
 /// `window` should be precomputed once per block type (`long_window()`,
-/// etc.) and reused across all 32 subbands — see `docs/mejoras.md` §3.2
+/// etc.) and reused across all 32 subbands — see `docs/investigation-log.md` §3.2
 /// M-4.
 pub fn transform_long(
     input: &[f32; 18],
@@ -501,7 +501,7 @@ pub fn antialias_butterfly(
 // Test fixtures/expected-value construction mirrors the standard's own
 // subscript notation throughout this module — see the module doc
 // comment above. Scoped to `tests` only; production code no longer
-// carries this allow (see docs/mejoras.md §7 item 6).
+// carries this allow (see docs/investigation-log.md §7 item 6).
 #[allow(clippy::needless_range_loop, clippy::disallowed_methods)]
 mod tests {
     use super::*;
@@ -665,6 +665,57 @@ mod tests {
     }
 
     // --- Forward transform API tests ---
+
+    /// Regression coverage the perfect-reconstruction tests above don't
+    /// provide: they verify a single MDCT block pair in isolation, never
+    /// `Encoder::mdct_stage`'s actual `mdct_prev_tail`-chaining pattern
+    /// across a run of granules. Simulates that exact `transform_long`
+    /// call and tail-update pattern for a single subband across several
+    /// consecutive granules, with a synthetic, continuous subband-domain
+    /// signal (isolated from the filterbank/psychoacoustic model
+    /// entirely). Added while investigating docs/investigation-log.md §11, "Where
+    /// the next session should start", step 3 (2026-08-29): this passing
+    /// cleanly rules the tail-passing mechanism itself out as that
+    /// investigation's fidelity-bug source -- kept as a permanent guard
+    /// against a regression there.
+    #[test]
+    fn transform_long_multi_granule_chaining_reconstructs() {
+        let w = long_window();
+        let n_granules = 6;
+        let signal: Vec<f32> = (0..18 * n_granules)
+            .map(|i| sin(i as f32 * 0.9) + 0.4 * sin(i as f32 * 0.31))
+            .collect();
+
+        let mut prev_tail = [0.0f32; 18];
+        let mut specs = Vec::new();
+        for gr in 0..n_granules {
+            let mut input = [0.0f32; 18];
+            input.copy_from_slice(&signal[gr * 18..gr * 18 + 18]);
+            let (spec, new_tail) = transform_long(&input, &prev_tail, &w);
+            specs.push(spec);
+            prev_tail = new_tail;
+        }
+
+        // The overlap between granule (gr-1) and granule gr's *z* arrays
+        // is granule (gr-1)'s own raw `input` -- i.e. `signal[(gr-1)*18
+        // .. gr*18)`, not granule gr's slice. See `transform_long`: its
+        // returned tail is `*input` for the granule that just ran, which
+        // becomes the *next* call's `prev_tail`, so the shared raw data
+        // between two consecutive granules' `z` blocks is always the
+        // earlier granule's own input.
+        for gr in 1..n_granules {
+            let y_prev = imdct_36(&specs[gr - 1]);
+            let y_cur = imdct_36(&specs[gr]);
+            for i in 0..18 {
+                let reconstructed = y_prev[18 + i] * w[18 + i] + y_cur[i] * w[i];
+                let expected = signal[(gr - 1) * 18 + i];
+                assert!(
+                    (reconstructed - expected).abs() < 1e-3,
+                    "granule {gr}, i={i}: got {reconstructed}, expected {expected}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn transform_long_returns_prev_as_tail() {
