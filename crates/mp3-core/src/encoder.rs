@@ -961,6 +961,7 @@ fn default_granule_side_info() -> crate::bitstream::side_info::GranuleSideInfo {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // f32::abs() in the diagnostic test -- see docs/investigation-log.md §7 item 6
 mod tests {
     // See crates/mp3-core/tests/m8_bitstream.rs for `Encoder`'s
     // integration tests.
