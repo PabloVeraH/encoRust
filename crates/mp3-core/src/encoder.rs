@@ -717,10 +717,8 @@ impl Encoder {
                     windows[2][6..12].copy_from_slice(&new[12..18]);
 
                     let spec_blocks = transform_short(&windows);
-                    for wi in 0..3 {
-                        for k in 0..6 {
-                            mdct_out[sb][wi * 6 + k] = spec_blocks[wi][k];
-                        }
+                    for (wi, block) in spec_blocks.iter().enumerate() {
+                        mdct_out[sb][wi * 6..wi * 6 + 6].copy_from_slice(block);
                     }
                     self.mdct_prev_tail[ch][sb] = new;
                 }

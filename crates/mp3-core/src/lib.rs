@@ -21,7 +21,10 @@
 //! them — they are explicitly exempt from semver guarantees.  External
 //! consumers must not depend on their contents directly.  See
 //! `docs/mp3-encoder/01-architecture.md` §5.
-#![cfg_attr(not(feature = "std"), no_std)]
+// Test builds always link std (libtest needs it anyway): the test-only
+// diagnostics use std::fs/env, thread_local! and the std prelude.
+// The no_std library itself is still checked by the wasm32 build.
+#![cfg_attr(not(any(feature = "std", test)), no_std)]
 #![deny(missing_docs)]
 #![warn(clippy::all)]
 #![deny(unsafe_op_in_unsafe_fn)]

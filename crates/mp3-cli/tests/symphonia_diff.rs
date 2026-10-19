@@ -330,8 +330,19 @@ fn diag_noise_peak_cross_check() {
 
     let status = Command::new("ffmpeg")
         .args([
-            "-y", "-hide_banner", "-loglevel", "error", "-i", &mp3_path, "-ac", "1", "-ar",
-            "44100", "-c:a", "pcm_s16le", &wav_path,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            &mp3_path,
+            "-ac",
+            "1",
+            "-ar",
+            "44100",
+            "-c:a",
+            "pcm_s16le",
+            &wav_path,
         ])
         .status();
     match status {
