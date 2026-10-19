@@ -6,6 +6,10 @@
 //!
 //! See `docs/investigation-log.md` §6.
 
+// clippy.toml bans std-only f32 math for mp3-core's no_std build; this
+// mp3-cli test always links std, so the ban does not apply here.
+#![allow(clippy::disallowed_methods)]
+
 use std::io::Cursor;
 
 use mp3_core::io::PcmBuffer;
